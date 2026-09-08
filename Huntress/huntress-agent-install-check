@@ -1,0 +1,49 @@
+<#
+.SYNOPSIS
+    Checks whether the Huntress Agent is installed on this machine.
+
+.DESCRIPTION
+    Looks for HuntressAgent.exe in both possible install locations
+    (64-bit "Program Files" and 32-bit "Program Files (x86)").
+    Outputs SUCCESS and exits 0 if either path is found.
+    Outputs FAILURE and exits 1 if neither path is found.
+
+    Exit codes are set deliberately so this script can be dropped
+    straight into an RMM tool (e.g. Datto RMM, NinjaOne, etc.) as a
+    monitor/check component - most RMM platforms treat exit code 0
+    as "pass" and any non-zero code as "fail".
+#>
+
+# Define both known install paths for HuntressAgent.exe.
+# Using an array so we only have to loop/check once rather than
+# duplicating the "if exists" logic twice.
+$huntressPaths = @(
+    "C:\Program Files\Huntress\HuntressAgent.exe",
+    "C:\Program Files (x86)\Huntress\HuntressAgent.exe"
+)
+
+# Track which path(s) actually exist so we can report exactly what was found.
+$foundPaths = foreach ($path in $huntressPaths) {
+    # Test-Path is used rather than Get-Item so a missing path doesn't throw an error.
+    if (Test-Path -Path $path -PathType Leaf) {
+        $path
+    }
+}
+
+# If $foundPaths has at least one entry, Huntress is installed.
+if ($foundPaths) {
+    Write-Output "SUCCESS: Huntress Agent found."
+    foreach ($path in $foundPaths) {
+        Write-Output "  Found: $path"
+    }
+    # Exit 0 = success, so RMM tools/schedulers treat this as a pass.
+    exit 0
+}
+else {
+    Write-Output "FAILURE: Huntress Agent not found at either expected location:"
+    foreach ($path in $huntressPaths) {
+        Write-Output "  Missing: $path"
+    }
+    # Exit 1 = failure, so RMM tools/schedulers flag this as an alert.
+    exit 1
+}

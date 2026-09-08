@@ -1,0 +1,45 @@
+<#
+.SYNOPSIS
+    Checks whether the ESET Management Agent is installed on this machine.
+
+.DESCRIPTION
+    Looks for ERAAgent.exe in the default ESET Management Agent install
+    location. This is the RMM/deployment agent used by ESET PROTECT /
+    ESET PROTECT On-Prem (formerly "ESET Remote Administrator Agent") -
+    NOT the endpoint antivirus product itself (that uses ekrn.exe under
+    a different folder).
+
+    Path confirmed against ESET's own documentation:
+    [KB7846] Deploy ESET Management Agent using Microsoft Intune/Endpoint
+    Manager - ESET lists this exact path as the detection-rule location
+    for the agent: https://support.eset.com/en/kb7846
+    (path also confirmed by the user against a known-good machine)
+
+    Outputs SUCCESS and exits 0 if the path is found.
+    Outputs FAILURE and exits 1 if it is not found.
+
+    Exit codes are set deliberately so this script can be dropped
+    straight into an RMM tool (e.g. Datto RMM, NinjaOne, etc.) as a
+    monitor/check component - most RMM platforms treat exit code 0
+    as "pass" and any non-zero code as "fail".
+#>
+
+# Only one confirmed path for this agent (unlike Huntress there is no
+# separate x86 install location documented for ERAAgent.exe - it's a
+# single 64-bit-only install path in ESET's own docs and in the path
+# the user confirmed).
+$esetAgentPath = "C:\Program Files\ESET\RemoteAdministrator\Agent\ERAAgent.exe"
+
+# Test-Path is used rather than Get-Item so a missing path doesn't throw an error.
+if (Test-Path -Path $esetAgentPath -PathType Leaf) {
+    Write-Output "SUCCESS: ESET Management Agent found."
+    Write-Output "  Found: $esetAgentPath"
+    # Exit 0 = success, so RMM tools/schedulers treat this as a pass.
+    exit 0
+}
+else {
+    Write-Output "FAILURE: ESET Management Agent not found at expected location:"
+    Write-Output "  Missing: $esetAgentPath"
+    # Exit 1 = failure, so RMM tools/schedulers flag this as an alert.
+    exit 1
+}

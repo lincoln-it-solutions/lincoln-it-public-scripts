@@ -1,0 +1,83 @@
+# ============================================================
+# Script: Identify a specific Directory to audit for largest file sizes
+# Purpose: Find which subfolders and files are taking up the
+#          most space inside a given folder.
+# Usage:
+#   Called with parameters so it can be reused across different
+#   machines/users/folders via RMM without editing the script body.
+#   Example (run manually):
+#     .\FolderSizeAnalysis.ps1 -TargetPath "C:\Users\JaneDoe\Dropbox" -TopFileCount 20
+# ============================================================
+
+param(
+    # The folder to analyze. Required — no default, so the RMM
+    # must supply it explicitly (avoids accidentally scanning
+    # the wrong user's folder if forgotten).
+    [Parameter(Mandatory = $true)]
+    [string]$TargetPath,
+
+    # How many of the largest individual files to list at the end.
+    # Defaults to 20 if not supplied by the caller.
+    [int]$TopFileCount = 20,
+
+    # How many subfolder levels deep to break down under $TargetPath.
+    # 1 = only direct children of $TargetPath (current default behavior).
+    # Kept as a parameter now so it's easy to extend later if needed.
+    [int]$SubfolderDepth = 1
+)
+
+# --- Confirm the path actually exists before doing anything else ---
+# Important for RMM use: if a path is wrong/missing on a given
+# machine, we want a clear error in the output/log rather than
+# the script silently doing nothing or throwing a cryptic exception.
+if (-not (Test-Path -Path $TargetPath)) {
+    Write-Host "Path not found: $TargetPath" -ForegroundColor Red
+    exit 1   # non-zero exit code so RMM can flag this run as failed
+}
+
+Write-Host "Analyzing: $TargetPath" -ForegroundColor Yellow
+
+# --- PART 1: Total size of the whole target folder ---
+
+# Recurse through everything inside, sum up file sizes (Length, in bytes)
+$totalSize = (Get-ChildItem -Path $TargetPath -Recurse -File -ErrorAction SilentlyContinue |
+    Measure-Object -Property Length -Sum).Sum
+
+Write-Host "`n=== TOTAL SIZE OF TARGET FOLDER ===" -ForegroundColor Cyan
+Write-Host ("{0:N2} GB" -f ($totalSize / 1GB))
+
+
+# --- PART 2: Size of each SUBFOLDER directly inside the target folder ---
+# This tells you which top-level subfolder (e.g. "Work", "Photos",
+# "Camera Uploads") is the biggest contributor.
+
+# Get only the folders sitting directly inside the target folder
+$subfolders = Get-ChildItem -Path $TargetPath -Directory -ErrorAction SilentlyContinue
+
+# For each subfolder, recurse into it and sum its file sizes
+$subfolderSizes = foreach ($folder in $subfolders) {
+    $size = (Get-ChildItem -Path $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        Measure-Object -Property Length -Sum).Sum
+
+    [PSCustomObject]@{
+        FolderName = $folder.Name
+        FullPath   = $folder.FullName
+        SizeGB     = if ($size) { [math]::Round($size / 1GB, 2) } else { 0 }
+    }
+}
+
+Write-Host "`n=== SUBFOLDER SIZES (DIRECTLY INSIDE TARGET FOLDER) ===" -ForegroundColor Cyan
+$subfolderSizes | Sort-Object SizeGB -Descending | Format-Table -AutoSize
+
+
+# --- PART 3: Largest individual FILES anywhere inside the target folder ---
+# Useful if a handful of huge files (e.g. videos, backups, zip
+# archives) are the real culprit rather than folder structure.
+# Uses $TopFileCount parameter instead of a hardcoded "20".
+
+$largestFiles = Get-ChildItem -Path $TargetPath -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object Length -Descending |
+    Select-Object -First $TopFileCount FullName, @{Name="SizeGB";Expression={[math]::Round($_.Length / 1GB, 2)}}
+
+Write-Host "`n=== TOP $TopFileCount LARGEST FILES INSIDE TARGET FOLDER ===" -ForegroundColor Cyan
+$largestFiles | Format-Table -AutoSize

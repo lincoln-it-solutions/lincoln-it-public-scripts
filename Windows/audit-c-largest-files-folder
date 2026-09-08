@@ -1,0 +1,50 @@
+# ============================================================
+# Script: Find largest files and folders on C:\
+# Notes:
+#   - Scanning the whole C: drive can take several minutes,
+#     especially with -Recurse and folder size calculations.
+#   - Run PowerShell "as Administrator" to avoid access-denied
+#     errors on system/protected folders (those will otherwise
+#     just be silently skipped via -ErrorAction SilentlyContinue).
+# ============================================================
+
+# --- PART 1: Largest individual FILES ---
+
+# Get-ChildItem recursively lists all items under C:\
+# -File restricts results to files only (not folders)
+# -ErrorAction SilentlyContinue suppresses errors from folders
+#   we don't have permission to read (e.g. system folders)
+$largestFiles = Get-ChildItem -Path C:\ -Recurse -File -ErrorAction SilentlyContinue |
+    # Sort by size (Length property, in bytes), largest first
+    Sort-Object Length -Descending |
+    # Only keep the top 20 results
+    Select-Object -First 20 FullName, @{Name="SizeGB";Expression={[math]::Round($_.Length / 1GB, 2)}}
+
+Write-Host "`n=== TOP 20 LARGEST FILES ===" -ForegroundColor Cyan
+$largestFiles | Format-Table -AutoSize
+
+
+# --- PART 2: Largest FOLDERS ---
+# Folder sizes aren't stored directly by Windows, so we have to
+# calculate each folder's total size by summing the files inside it.
+# This is the slow part — it recurses into every subfolder.
+
+# Get top-level folders under C:\ as our starting point
+# (you can change depth/target folder below if this is too slow)
+$folders = Get-ChildItem -Path C:\ -Directory -ErrorAction SilentlyContinue
+
+# For each folder, calculate the sum of all file sizes within it
+$folderSizes = foreach ($folder in $folders) {
+    # Measure-Object -Sum adds up the Length (bytes) of all files found
+    $size = (Get-ChildItem -Path $folder.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        Measure-Object -Property Length -Sum).Sum
+
+    # Output a custom object with folder path and size in GB
+    [PSCustomObject]@{
+        FolderPath = $folder.FullName
+        SizeGB     = if ($size) { [math]::Round($size / 1GB, 2) } else { 0 }
+    }
+}
+
+Write-Host "`n=== FOLDER SIZES (TOP-LEVEL UNDER C:\) ===" -ForegroundColor Cyan
+$folderSizes | Sort-Object SizeGB -Descending | Format-Table -AutoSize
