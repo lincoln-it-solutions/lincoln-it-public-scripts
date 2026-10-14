@@ -1,0 +1,268 @@
+<#
+.SYNOPSIS
+    TRMM script check: is the ScreenConnect access client installed, and does
+    ScreenConnect have the machine under the company it belongs to?
+
+.DESCRIPTION
+    Two things are checked, in this order.
+
+      1. Service - "ScreenConnect Client (<InstanceId>)" must exist. Whether it is
+                   running is deliberately NOT checked here: a separate TRMM check
+                   already restarts a stopped ScreenConnect service.
+                   The instance ID is the part in brackets in the service name. It is
+                   passed in as -InstanceId so that a client installed from some OTHER
+                   ScreenConnect instance (an old one, or somebody else's) does not count
+                   as "installed". If -InstanceId is left out, any ScreenConnect client
+                   service is accepted.
+
+      2. Company - The company ScreenConnect itself holds for this machine (what the
+                   console shows) is compared with the expected company, ignoring
+                   upper/lower case. A script on the machine cannot ask the
+                   ScreenConnect server, so the bridge does: on a schedule it reads every
+                   machine's Company from ScreenConnect and writes it into the TRMM agent
+                   custom field "ScreenConnectCompanyActual". TRMM hands that value to
+                   this script as -ActualCompany.
+
+    WHY NOT THE VALUE ON THE MACHINE
+      The client keeps the launch string it was installed with in its service's
+      ImagePath, and the first c= in it is the company it was INSTALLED under. That
+      value never changes afterwards. Proven 2026-10-09 on BIFL-PC-2348: the machine
+      still said 'Bifrangi UK Ltd' while the console said 'Bifrangi'. Comparing it gave
+      a false "wrong company". It is still printed ("Installed as") because it is useful
+      to see, but it is never compared and never fails the check.
+
+    WHERE THE EXPECTED COMPANY COMES FROM
+      Normally the client: -ClientCompany. If the machine's SITE has its own company
+      (-SiteCompany), that wins. So only a site that is a separate company in
+      ScreenConnect needs a site value - every other site, including any new one added
+      later, simply inherits its client's company.
+
+    WHAT THE BRIDGE WRITES INTO THE AGENT FIELD
+      the company     the machine's Company in ScreenConnect       -> compared
+      (blank)         the machine is in ScreenConnect with NO Company -> reported as wrong
+      nothing         the bridge has not matched this machine yet (new machine, or no
+                      record found)                                  -> not compared, passes
+      So a brand new machine does not alert in the gap before the bridge's next run.
+      The answer is only as fresh as that last run.
+
+    This script only REPORTS. It never installs, starts, stops or changes anything.
+
+    ONE SCRIPT, TWO TRMM CHECKS (-Mode)
+      TRMM marks a script check as failing on any exit code that is not a success code,
+      and an "On Check Failure" task runs whenever the check it is assigned to fails -
+      it cannot tell exit 1 from exit 2. So to ACT on one state and only be TOLD about
+      the other, the policy needs two checks, one per mode.
+      IMPORTANT: TRMM keeps only ONE script check per script on an agent (automation/
+      models.py: "Check if script id was already added"), so two checks that use the same
+      TRMM script do not both run - the second is silently dropped (seen 2026-10-09).
+      This file is therefore stored in TRMM as TWO scripts with the same code,
+      "ScreenConnect Company Check" and "ScreenConnect Installed Check", one for each check:
+        -Mode Installed  fails (exit 1) only when the client is not installed.
+                         Assign the install task to THIS check.
+        -Mode Company    fails (exit 2) only when it is installed under the wrong
+                         company. Assign NO task to this check, so it only alerts.
+                         Put 2 under "Warning return codes" to make it a Warning.
+                         A machine with no client passes here: the Installed check
+                         already reports that, and one problem should not alert twice.
+      Left out (or -Mode Both), the script reports both states in one check.
+
+    Exit codes:
+      0 = nothing to report for the chosen mode
+      1 = NOT INSTALLED - no client for this ScreenConnect instance on the machine
+      2 = WRONG COMPANY - ScreenConnect has the machine under a different company, or none
+      3 = the check itself is set up wrongly (unknown -Mode value)
+
+.PARAMETER InstanceId
+    The ScreenConnect instance ID, e.g. 0123456789abcdef. Optional - see above.
+
+.PARAMETER ClientCompany
+    The Company for the whole client. In a TRMM check, pass the client's custom field:
+    -ClientCompany {{client.ScreenConnectCompany}}
+
+.PARAMETER SiteCompany
+    Optional override for one site. In a TRMM check, pass the site's custom field:
+    -SiteCompany {{site.ScreenConnectCompany}}
+    Used instead of -ClientCompany when it has a value.
+
+    If neither has a value (left out, empty, or TRMM could not fill the field in), only
+    the service is checked.
+
+.PARAMETER ActualCompany
+    The Company ScreenConnect holds for this machine, as recorded by the bridge. In a TRMM
+    check, pass the agent's custom field:
+    -ActualCompany {{agent.ScreenConnectCompanyActual}}
+
+.PARAMETER Mode
+    Installed, Company or Both (the default). See "ONE SCRIPT, TWO TRMM CHECKS" above.
+#>
+param(
+    [string]$InstanceId = '',
+    [string]$ClientCompany = '',
+    [string]$SiteCompany = '',
+    [string]$ActualCompany = '',
+    [string]$Mode = 'Both'
+)
+
+# Collect every problem rather than stopping at the first, so the TRMM check output
+# shows the full picture in one run. Each list maps to one exit code.
+$failures = New-Object System.Collections.Generic.List[string]   # not installed   -> 1
+$warnings = New-Object System.Collections.Generic.List[string]   # company problem -> 2
+
+# TRMM docs: set PowerShell exit codes via $host.SetShouldExit(); exit stops the script.
+function Complete-Check([int]$code) {
+    $host.SetShouldExit($code)
+    exit $code
+}
+
+# Which state this run reports on. Quotes are stripped because TRMM may hand the value over
+# wrapped in them. An unknown value stops the check with its own exit code (3) instead of
+# quietly behaving like one of the real modes - a mistyped mode must not look like a pass.
+$Mode = "$Mode".Trim().Trim("'").Trim('"').Trim()
+if (-not $Mode) { $Mode = 'Both' }
+if ($Mode -notin @('Both', 'Installed', 'Company')) {
+    Write-Output "CHECK SET UP WRONGLY: -Mode '$Mode' is not valid. Use Installed, Company or Both."
+    Complete-Check 3
+}
+# Tidy the capitalisation (-notin ignores case) so later comparisons and the output are consistent.
+$Mode = @('Both', 'Installed', 'Company') | Where-Object { $_ -ieq $Mode } | Select-Object -First 1
+
+# ---------------------------------------------------------------------------
+# 1. SERVICE
+# ---------------------------------------------------------------------------
+# Every ScreenConnect client service on the machine, whichever instance it belongs to.
+# Listed in the output so a leftover client from another instance is visible.
+$allClients = @(Get-Service -Name 'ScreenConnect Client (*' -ErrorAction SilentlyContinue)
+
+$InstanceId = "$InstanceId".Trim()
+if ($InstanceId) {
+    $wantedName = "ScreenConnect Client ($InstanceId)"
+    $service = $allClients | Where-Object { $_.Name -eq $wantedName } | Select-Object -First 1
+}
+else {
+    # No instance given: accept any ScreenConnect client found on the machine.
+    $wantedName = 'ScreenConnect Client (any instance)'
+    $service = $allClients | Select-Object -First 1
+}
+
+# In Company mode a missing client is left to the Installed check, so it is not a failure here.
+if ((-not $service) -and ($Mode -ne 'Company')) {
+    $failures.Add("Service '$wantedName' is NOT installed.")
+    foreach ($other in $allClients) {
+        # Worth knowing: the machine has ScreenConnect, just not ours.
+        $failures.Add("Found a different ScreenConnect client instead: '$($other.Name)'.")
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 2. COMPANY
+# ---------------------------------------------------------------------------
+# Tidy a value handed over by TRMM. TRMM wraps a custom field's value in single quotes,
+# and if the field does not exist or has no value it passes the {{...}} placeholder
+# through untouched - treat that the same as "nothing given" rather than as a company name.
+#
+# The placeholder does NOT arrive with two braces. The TRMM agent starts PowerShell
+# without -File, so PowerShell parses the arguments itself and reads {{name}} as a
+# script block inside a script block; turned into text that is {name}, with ONE brace
+# each side (seen on a real run 2026-10-09: "Expected: {site.ScreenConnectCompany}").
+# So anything that is wrapped in one or more braces counts as an unfilled placeholder.
+# No ScreenConnect company name is wrapped in braces, so this cannot hide a real value.
+function Get-CleanValue([string]$value) {
+    $clean = "$value".Trim().Trim("'").Trim('"').Trim()
+    if ($clean -match '^\{+.*\}+$') { return '' }
+    return $clean
+}
+
+# The site's own company wins; otherwise the machine inherits its client's company.
+$siteValue   = Get-CleanValue $SiteCompany
+$clientValue = Get-CleanValue $ClientCompany
+if ($siteValue)       { $expected = $siteValue;   $expectedFrom = 'site' }
+elseif ($clientValue) { $expected = $clientValue; $expectedFrom = 'client' }
+else                  { $expected = '';           $expectedFrom = '' }
+
+# What ScreenConnect holds for this machine, as last recorded by the bridge.
+#   ''           = nothing recorded (field empty, or TRMM passed the placeholder through)
+#   '(blank)'    = the bridge found the machine in ScreenConnect with no Company at all
+#   anything else = the Company
+$actual = Get-CleanValue $ActualCompany
+$actualIsBlank = ($actual -ieq '(blank)')
+
+# The company the client was INSTALLED under, read from the machine. Information only -
+# see "WHY NOT THE VALUE ON THE MACHINE" at the top. $null = not read.
+$installedAs = $null
+if ($service) {
+    # -LiteralPath because the service name contains brackets.
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+    $imagePath = (Get-ItemProperty -LiteralPath $key -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+    if ($imagePath) {
+        # ImagePath looks like:  "...\ScreenConnect.ClientService.exe" "?e=Access&y=Guest&h=...&c=Company&c=Site&c=..."
+        # Take everything after the "?" and read the c= entries in order.
+        $query = ''
+        $at = $imagePath.IndexOf('?')
+        if ($at -ge 0) { $query = $imagePath.Substring($at + 1).Trim().TrimEnd('"') }
+
+        $customValues = @()
+        foreach ($pair in ($query -split '&')) {
+            if ($pair -like 'c=*') {
+                # Values are URL-encoded (a space is %20), so decode them before showing them.
+                $customValues += [uri]::UnescapeDataString($pair.Substring(2))
+            }
+        }
+        if ($customValues.Count -gt 0) { $installedAs = "$($customValues[0])".Trim() } else { $installedAs = '' }
+    }
+
+    # The comparison. Only when: the client is installed (a missing client is the Installed
+    # check's business), this run is not Installed-only, an expected company was supplied,
+    # and the bridge has recorded something for this machine.
+    if ($expected -and ($Mode -ne 'Installed') -and $actual) {
+        if ($actualIsBlank) {
+            $warnings.Add("ScreenConnect has this machine with NO company. This $expectedFrom should be '$expected'.")
+        }
+        elseif ($actual -ine $expected) {
+            $warnings.Add("ScreenConnect has this machine under company '$actual', but this $expectedFrom should be '$expected'.")
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# RESULT
+# ---------------------------------------------------------------------------
+Write-Output "Mode    : $Mode"
+if ($service)           { Write-Output "Service : $($service.Name)" }
+if ($Mode -ne 'Installed') {
+    if ($actualIsBlank) { Write-Output 'Company : (none set in ScreenConnect)' }
+    elseif ($actual)    { Write-Output "Company : $actual (in ScreenConnect, as last recorded by the bridge)" }
+    else                { Write-Output 'Company : (nothing recorded by the bridge for this machine yet)' }
+}
+# Shown for information only; never compared.
+if ($null -ne $installedAs) { Write-Output "Installed as: $(if ($installedAs) { $installedAs } else { '(no company at install)' })" }
+if ($Mode -eq 'Installed') { Write-Output 'Expected: (not compared - this check only looks at whether the client is installed)' }
+elseif ($expected)         { Write-Output "Expected: $expected (from the $expectedFrom)" }
+else                       { Write-Output 'Expected: (no company supplied - service check only)' }
+
+# Installed mode answers one question only. Drop any company finding, as a second line of
+# defence, so this check can never fail on a machine that HAS the client -
+# the install task is assigned to it, and must not run on an installed machine.
+if ($Mode -eq 'Installed') { $warnings.Clear() }
+
+if ($failures.Count -gt 0) {
+    Write-Output ''
+    Write-Output 'NOT INSTALLED:'
+    $failures | ForEach-Object { Write-Output " - $_" }
+    Complete-Check 1
+}
+
+if ($warnings.Count -gt 0) {
+    Write-Output ''
+    Write-Output 'WRONG COMPANY:'
+    $warnings | ForEach-Object { Write-Output " - $_" }
+    Complete-Check 2
+}
+
+Write-Output ''
+# Say exactly what was and was not established, so a pass is never read as more than it is.
+if (-not $service)             { Write-Output 'OK for this check: ScreenConnect is NOT installed, so there is no company to compare. The Installed check reports that.' }
+elseif ($Mode -eq 'Installed') { Write-Output 'OK: ScreenConnect is installed.' }
+elseif (-not $expected)        { Write-Output 'OK: ScreenConnect is installed. No expected company was supplied, so the company was not compared.' }
+elseif (-not $actual)          { Write-Output 'OK: ScreenConnect is installed. The bridge has not recorded a company for this machine yet, so the company was not compared.' }
+else                           { Write-Output 'OK: ScreenConnect is installed and is under the expected company in ScreenConnect.' }
+Complete-Check 0
