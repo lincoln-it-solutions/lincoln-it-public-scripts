@@ -1,0 +1,532 @@
+<#
+    Get-DiskUsageReport.ps1
+
+    WHAT IT DOES
+    Read-only disk usage report for one drive, measured as SIZE ON DISK.
+    It deletes nothing and changes nothing.
+
+    WHY IT EXISTS
+    The original report only accounted for about 65 GB on a drive with about 193 GB used.
+    This version includes hidden and system items, lists the files sitting in the drive root
+    (pagefile.sys, hiberfil.sys etc.), reports shadow copy storage, and prints how much used
+    space it still could NOT account for, so a gap is visible instead of silently missing.
+
+    HOW SIZE ON DISK IS MEASURED
+      1. Each file is measured with the Windows API GetCompressedFileSizeW, which Microsoft
+         documents as returning "the actual number of bytes of disk storage used to store a
+         specified file" (it returns the compressed size for compressed files and the sparse
+         size for sparse files, e.g. OneDrive online-only files).
+      2. That figure is rounded up to the volume's cluster size, because a file occupies
+         whole clusters.
+      3. A file with several hard links (common under C:\Windows) is counted ONCE, the first
+         time it is met. Tools that ignore hard links overstate folders such as WinSxS.
+    The plain file length is also shown (LogicalGB) so the two can be compared.
+
+    HOW TO RUN
+    Elevated, or as SYSTEM from the RMM. Without elevation most protected folders are
+    unreadable and the "Unaccounted" figure will be large. It opens every file on the drive
+    once to read its link count, so expect it to take several minutes.
+
+    LIMITS
+      - Very small files that NTFS stores inside its own file table are still rounded up to
+        one cluster each, so folders full of tiny files are slightly overstated.
+      - A hard-linked file is attributed to whichever folder is scanned first (alphabetical).
+      - NTFS's own metadata is not a file this script can see, so "Unaccounted" is never
+        expected to be exactly zero.
+#>
+
+# ----------------------------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------------------------
+
+# Drive to inspect (letter and colon, no trailing backslash).
+$Drive = 'C:'
+
+# How many folder levels below the drive root get their own size recorded.
+# 1 = C:\Windows, 2 = C:\ProgramData\Dell, 5 = C:\ProgramData\Dell\a\b\c.
+# Deeper levels are still counted in their parent. 5 is deep enough to show which
+# sub-folder of a large folder actually holds the space without re-running the script.
+$RecordDepth = 5
+
+# Only folders at least this big (size on disk) are listed in the "large folders" section.
+# Without a cut-off that section would list tens of thousands of small folders.
+$MinFolderGB = 1
+
+# ----------------------------------------------------------------------------------------
+# The scanner (C#, compiled in memory by Add-Type)
+#
+# Why C# instead of plain PowerShell:
+#   - PowerShell has no built-in way to read size on disk or a file's hard-link count;
+#     both need Windows API calls.
+#   - Making those calls once per file from a PowerShell loop is very slow on a whole drive.
+#   - Calling the Windows APIs directly with the \\?\ path prefix also avoids the 260
+#     character path limit that makes Get-ChildItem skip deep folders.
+# The syntax is deliberately kept to what Windows PowerShell 5.1's compiler accepts.
+# ----------------------------------------------------------------------------------------
+
+$ScannerSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+// One row per recorded folder.
+public class DiskUsageFolder
+{
+    public string FolderPath;
+    public string Parent;
+    public int    Depth;
+    public long   OnDiskBytes;
+    public long   LogicalBytes;
+}
+
+// One row per file sitting directly in the drive root.
+public class DiskUsageRootFile
+{
+    public string Name;
+    public long   OnDiskBytes;
+    public long   LogicalBytes;
+}
+
+public class DiskUsageScanner
+{
+    // ---- Windows constants ----------------------------------------------------------
+    const uint INVALID_FILE_SIZE            = 0xFFFFFFFF;
+    const uint FILE_ATTRIBUTE_DIRECTORY     = 0x00000010;
+    const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    const uint IO_REPARSE_TAG_MOUNT_POINT   = 0xA0000003;  // junction / mounted volume
+    const uint IO_REPARSE_TAG_SYMLINK       = 0xA000000C;  // symbolic link
+    const uint FILE_SHARE_ALL               = 0x00000007;  // read | write | delete
+    const uint OPEN_EXISTING                = 3;
+    const uint FILE_FLAG_BACKUP_SEMANTICS   = 0x02000000;
+    const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    const int  ERROR_FILE_NOT_FOUND         = 2;
+    const int  ERROR_NO_MORE_FILES          = 18;
+
+    // The \\?\ prefix tells Windows to accept paths longer than 260 characters.
+    const string LongPrefix = @"\\?\";
+
+    static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+    // ---- Windows structures ---------------------------------------------------------
+    // FILETIME values are declared as two 32-bit halves (not one 64-bit value) so the
+    // field layout matches Windows exactly. The timestamps themselves are not used.
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WIN32_FIND_DATAW
+    {
+        public uint dwFileAttributes;
+        public uint ftCreationTimeLow;   public uint ftCreationTimeHigh;
+        public uint ftLastAccessTimeLow; public uint ftLastAccessTimeHigh;
+        public uint ftLastWriteTimeLow;  public uint ftLastWriteTimeHigh;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint dwReserved0;         // holds the reparse tag when the item is a reparse point
+        public uint dwReserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string cFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]  public string cAlternateFileName;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint dwFileAttributes;
+        public uint ftCreationTimeLow;   public uint ftCreationTimeHigh;
+        public uint ftLastAccessTimeLow; public uint ftLastAccessTimeHigh;
+        public uint ftLastWriteTimeLow;  public uint ftLastWriteTimeHigh;
+        public uint dwVolumeSerialNumber;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint nNumberOfLinks;      // more than 1 means the file has hard links
+        public uint nFileIndexHigh;      // nFileIndexHigh + Low identify the file on the volume
+        public uint nFileIndexLow;
+    }
+
+    // ---- Windows API calls ----------------------------------------------------------
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATAW lpFindFileData);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATAW lpFindFileData);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool FindClose(IntPtr hFindFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess,
+        uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle hFile,
+        out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool GetDiskFreeSpaceW(string lpRootPathName, out uint lpSectorsPerCluster,
+        out uint lpBytesPerSector, out uint lpNumberOfFreeClusters,
+        out uint lpTotalNumberOfClusters);
+
+    // ---- Results read by the PowerShell part of the script --------------------------
+
+    public List<DiskUsageFolder>   Folders    = new List<DiskUsageFolder>();
+    public List<DiskUsageRootFile> RootFiles  = new List<DiskUsageRootFile>();
+    public List<string>            Unreadable = new List<string>();
+
+    public long ClusterBytes;         // cluster size of the volume
+    public long TotalOnDiskBytes;     // everything found, size on disk
+    public long TotalLogicalBytes;    // everything found, plain file lengths
+    public long FilesSeen;            // number of files examined
+    public long HardLinkDuplicates;   // extra hard links NOT counted again
+    public long LinksSkipped;         // junctions / symlinks not followed
+    public long SizeFallbacks;        // files where size on disk could not be read
+    public long LinkInfoFailures;     // files where the hard-link count could not be read
+
+    // How many folder levels below the root get their own row in Folders.
+    public int RecordDepth = 2;
+
+    // IDs of hard-linked files already counted, so each is only counted once.
+    // (A Dictionary is used as a set because it needs no extra assembly reference
+    // in Windows PowerShell 5.1.)
+    Dictionary<ulong, bool> seenHardLinks = new Dictionary<ulong, bool>();
+
+    // A file occupies whole clusters, so round its size up to the next cluster boundary.
+    long RoundUpToCluster(long bytes)
+    {
+        if (ClusterBytes <= 0 || bytes <= 0) { return bytes; }
+        return ((bytes + ClusterBytes - 1) / ClusterBytes) * ClusterBytes;
+    }
+
+    // Entry point. root must look like "C:\".
+    public void Scan(string root)
+    {
+        // Ask Windows for the cluster size of this volume.
+        uint sectorsPerCluster, bytesPerSector, freeClusters, totalClusters;
+        if (GetDiskFreeSpaceW(root, out sectorsPerCluster, out bytesPerSector,
+                              out freeClusters, out totalClusters))
+        {
+            ClusterBytes = (long)sectorsPerCluster * bytesPerSector;
+        }
+
+        long onDisk, logical;
+        Walk(root, 0, null, out onDisk, out logical);
+        TotalOnDiskBytes  = onDisk;
+        TotalLogicalBytes = logical;
+    }
+
+    // Adds up one folder and everything beneath it.
+    void Walk(string path, int depth, string parent, out long onDisk, out long logical)
+    {
+        onDisk  = 0;
+        logical = 0;
+
+        // "C:\" already ends in a backslash; every other folder needs one added.
+        string prefix = path.EndsWith("\\") ? path : path + "\\";
+
+        WIN32_FIND_DATAW fd;
+        IntPtr find = FindFirstFileW(LongPrefix + prefix + "*", out fd);
+
+        if (find == InvalidHandle)
+        {
+            // "Not found" just means an empty folder. Anything else (usually error 5,
+            // access denied) is a blind spot and is recorded so it can be reported.
+            int err = Marshal.GetLastWin32Error();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES)
+            {
+                Unreadable.Add(path + "  (Windows error " + err + ")");
+            }
+        }
+        else
+        {
+            try
+            {
+                do
+                {
+                    string name = fd.cFileName;
+
+                    // Every folder lists itself and its parent; skip both.
+                    if (name == "." || name == "..") { continue; }
+
+                    string full      = prefix + name;
+                    bool   isDir     = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    bool   isReparse = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+                    // Junctions and symlinks point at data that lives somewhere else
+                    // (e.g. "C:\Documents and Settings" -> C:\Users). Following them would
+                    // count that data twice, and for a file symlink the size API returns
+                    // the TARGET's size, so both kinds are skipped.
+                    // Other reparse points (e.g. OneDrive folders) hold real data and are
+                    // scanned normally.
+                    bool isLink = isReparse &&
+                                  (fd.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT ||
+                                   fd.dwReserved0 == IO_REPARSE_TAG_SYMLINK);
+                    if (isLink) { LinksSkipped++; continue; }
+
+                    if (isDir)
+                    {
+                        long subOnDisk, subLogical;
+                        Walk(full, depth + 1, path, out subOnDisk, out subLogical);
+                        onDisk  += subOnDisk;
+                        logical += subLogical;
+                        continue;
+                    }
+
+                    // ---- From here on the item is a file ----
+                    FilesSeen++;
+
+                    // Plain file length, as Explorer shows under "Size".
+                    long length = ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                    logical += length;
+
+                    // Hard-link check. The file is opened asking for no access at all
+                    // (0), which is enough to read its link count and ID and works on
+                    // files that are in use.
+                    bool alreadyCounted = false;
+                    using (SafeFileHandle handle = CreateFileW(LongPrefix + full, 0,
+                               FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                               IntPtr.Zero))
+                    {
+                        BY_HANDLE_FILE_INFORMATION info;
+                        if (!handle.IsInvalid && GetFileInformationByHandle(handle, out info))
+                        {
+                            if (info.nNumberOfLinks > 1)
+                            {
+                                ulong id = ((ulong)info.nFileIndexHigh << 32) | info.nFileIndexLow;
+                                if (seenHardLinks.ContainsKey(id)) { alreadyCounted = true; }
+                                else { seenHardLinks[id] = true; }
+                            }
+                        }
+                        else
+                        {
+                            // Could not check (e.g. pagefile.sys). The file is still
+                            // counted below; it just cannot be de-duplicated.
+                            LinkInfoFailures++;
+                        }
+                    }
+
+                    // Same data as a file already counted under another name: its
+                    // clusters are already in the total, so add nothing.
+                    if (alreadyCounted) { HardLinkDuplicates++; continue; }
+
+                    // Size on disk as reported by Windows.
+                    long allocated;
+                    uint high;
+                    uint low = GetCompressedFileSizeW(LongPrefix + full, out high);
+                    if (low == INVALID_FILE_SIZE && Marshal.GetLastWin32Error() != 0)
+                    {
+                        // Windows refused (e.g. pagefile.sys is locked). Fall back to the
+                        // plain length so the file is not lost from the total.
+                        allocated = length;
+                        SizeFallbacks++;
+                    }
+                    else
+                    {
+                        allocated = ((long)high << 32) | low;
+                    }
+                    allocated = RoundUpToCluster(allocated);
+                    onDisk += allocated;
+
+                    // Files sitting directly in the drive root get their own table.
+                    if (depth == 0)
+                    {
+                        DiskUsageRootFile rootFile = new DiskUsageRootFile();
+                        rootFile.Name         = name;
+                        rootFile.OnDiskBytes  = allocated;
+                        rootFile.LogicalBytes = length;
+                        RootFiles.Add(rootFile);
+                    }
+                }
+                while (FindNextFileW(find, out fd));
+            }
+            finally
+            {
+                FindClose(find);
+            }
+        }
+
+        // Record this folder's total if it is within the levels being reported.
+        if (depth >= 1 && depth <= RecordDepth)
+        {
+            DiskUsageFolder row = new DiskUsageFolder();
+            row.FolderPath   = path;
+            row.Parent       = parent;
+            row.Depth        = depth;
+            row.OnDiskBytes  = onDisk;
+            row.LogicalBytes = logical;
+            Folders.Add(row);
+        }
+    }
+}
+'@
+
+# Compile the scanner. The check stops a second run in the same PowerShell session from
+# failing with "type already exists".
+if (-not ('DiskUsageScanner' -as [type])) {
+    Add-Type -TypeDefinition $ScannerSource -Language CSharp
+}
+
+# ----------------------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------------------
+
+function ConvertTo-GB {
+    # Bytes to GB, 2 decimal places.
+    param([long]$Bytes)
+    [math]::Round($Bytes / 1GB, 2)
+}
+
+function Write-Table {
+    # Renders a table at a fixed width so RMM consoles do not truncate long paths.
+    param($Rows)
+    ($Rows | Format-Table -AutoSize | Out-String -Width 200).TrimEnd()
+}
+
+function Select-FolderRows {
+    # Turns scanner rows into display rows, largest size on disk first.
+    param($Rows)
+    $Rows |
+        Sort-Object OnDiskBytes -Descending |
+        Select-Object FolderPath,
+            @{ n = 'SizeOnDiskGB'; e = { ConvertTo-GB $_.OnDiskBytes } },
+            @{ n = 'LogicalGB';    e = { ConvertTo-GB $_.LogicalBytes } }
+}
+
+# ----------------------------------------------------------------------------------------
+# 0. Elevation check - warn early, because an unelevated run gives misleading numbers
+# ----------------------------------------------------------------------------------------
+
+$Identity   = [Security.Principal.WindowsIdentity]::GetCurrent()
+$IsElevated = (New-Object Security.Principal.WindowsPrincipal $Identity).IsInRole(
+                  [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+"=== RUN CONTEXT ==="
+"Running as : $($Identity.Name)"
+"Elevated   : $IsElevated"
+if (-not $IsElevated) { "WARNING: not elevated - protected folders will be unreadable." }
+
+# ----------------------------------------------------------------------------------------
+# 1. What Windows itself says is used - this is the figure everything else must add up to
+# ----------------------------------------------------------------------------------------
+
+$Disk      = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$Drive'"
+$UsedBytes = $Disk.Size - $Disk.FreeSpace
+
+""
+"=== VOLUME $Drive ==="
+"Size : {0,8:N2} GB" -f ($Disk.Size / 1GB)
+"Used : {0,8:N2} GB" -f ($UsedBytes / 1GB)
+"Free : {0,8:N2} GB" -f ($Disk.FreeSpace / 1GB)
+
+# ----------------------------------------------------------------------------------------
+# 2. Scan the whole drive once
+#    A single pass is used (rather than one pass per section) so that every hard-linked
+#    file is counted exactly once across the whole report.
+# ----------------------------------------------------------------------------------------
+
+$Scanner             = New-Object DiskUsageScanner
+$Scanner.RecordDepth = $RecordDepth
+$Timer               = [Diagnostics.Stopwatch]::StartNew()
+$Scanner.Scan("$Drive\")
+$Timer.Stop()
+
+""
+"=== SCAN ==="
+"Cluster size                      : $($Scanner.ClusterBytes) bytes"
+"Files examined                    : $($Scanner.FilesSeen)"
+"Extra hard links not re-counted   : $($Scanner.HardLinkDuplicates)"
+"Junctions/symlinks not followed   : $($Scanner.LinksSkipped)"
+"Files using plain length instead  : $($Scanner.SizeFallbacks)   (size on disk unreadable)"
+"Files not checked for hard links  : $($Scanner.LinkInfoFailures)"
+"Scan time                         : $([int]$Timer.Elapsed.TotalSeconds) seconds"
+
+# ----------------------------------------------------------------------------------------
+# 3. Files in the drive root, including hidden/system ones
+#    This is where pagefile.sys, hiberfil.sys and swapfile.sys live. They belong to no
+#    folder, so a folder-only report can never show them.
+# ----------------------------------------------------------------------------------------
+
+$RootFileBytes = ($Scanner.RootFiles | Measure-Object OnDiskBytes -Sum).Sum
+
+""
+"=== FILES IN $Drive\ (INCLUDING HIDDEN/SYSTEM) ==="
+Write-Table ($Scanner.RootFiles |
+    Sort-Object OnDiskBytes -Descending |
+    Select-Object Name,
+        @{ n = 'SizeOnDiskGB'; e = { ConvertTo-GB $_.OnDiskBytes } },
+        @{ n = 'LogicalGB';    e = { ConvertTo-GB $_.LogicalBytes } })
+
+# ----------------------------------------------------------------------------------------
+# 4. Every top-level folder, including hidden/system ones
+#    Unlike the first report this includes ProgramData, $Recycle.Bin,
+#    System Volume Information, Recovery and the hidden AppData inside each user profile.
+#    A LogicalGB far above SizeOnDiskGB means hard links, compression or online-only files.
+# ----------------------------------------------------------------------------------------
+
+""
+"=== TOP-LEVEL FOLDERS UNDER $Drive\ (INCLUDING HIDDEN/SYSTEM) ==="
+Write-Table (Select-FolderRows ($Scanner.Folders | Where-Object { $_.Depth -eq 1 }))
+
+# ----------------------------------------------------------------------------------------
+# 5. Reconciliation - how much of the used space the report explains
+#    A large "Unaccounted" figure means the space is somewhere this script could not read
+#    (see section 8) or is not held in ordinary files at all.
+# ----------------------------------------------------------------------------------------
+
+""
+"=== RECONCILIATION (SIZE ON DISK) ==="
+"Used according to Windows : {0,8:N2} GB" -f ($UsedBytes / 1GB)
+"Found in folders          : {0,8:N2} GB" -f (($Scanner.TotalOnDiskBytes - $RootFileBytes) / 1GB)
+"Found in root files       : {0,8:N2} GB" -f ($RootFileBytes / 1GB)
+"Unaccounted               : {0,8:N2} GB" -f (($UsedBytes - $Scanner.TotalOnDiskBytes) / 1GB)
+
+# ----------------------------------------------------------------------------------------
+# 6. Every large folder below the top level, down to $RecordDepth levels
+#    Replaces the fixed Users/ProgramData breakdown: any folder of $MinFolderGB or more is
+#    listed wherever it is, so the sub-folder holding the space shows up without having to
+#    know its name in advance.
+#    Sorted by PATH (not size) so each folder appears directly under its parent, like a
+#    tree. A parent's figure includes its children, so do not add the rows together.
+# ----------------------------------------------------------------------------------------
+
+$LargeFolders = $Scanner.Folders |
+    Where-Object { $_.Depth -ge 2 -and $_.OnDiskBytes -ge ($MinFolderGB * 1GB) } |
+    Sort-Object FolderPath |
+    Select-Object FolderPath,
+        @{ n = 'SizeOnDiskGB'; e = { ConvertTo-GB $_.OnDiskBytes } },
+        @{ n = 'LogicalGB';    e = { ConvertTo-GB $_.LogicalBytes } }
+
+""
+"=== FOLDERS OF $MinFolderGB GB OR MORE, LEVELS 2 TO $RecordDepth (PARENT FIGURES INCLUDE CHILDREN) ==="
+if ($LargeFolders) { Write-Table $LargeFolders } else { "None" }
+
+# ----------------------------------------------------------------------------------------
+# 7. Shadow copy storage (restore points / previous versions / backup snapshots)
+#    Shown as a cross-check on the System Volume Information figure above. Needs elevation.
+# ----------------------------------------------------------------------------------------
+
+""
+"=== SHADOW COPY STORAGE (vssadmin list shadowstorage) ==="
+(& vssadmin.exe list shadowstorage 2>&1 | Out-String).Trim()
+
+# ----------------------------------------------------------------------------------------
+# 8. Anything that could not be read - these are the blind spots in the numbers above
+# ----------------------------------------------------------------------------------------
+
+""
+"=== FOLDERS THAT COULD NOT BE READ ($($Scanner.Unreadable.Count)) ==="
+if ($Scanner.Unreadable.Count -gt 0) {
+    # Capped at 50 lines so one locked-down tree does not flood the output.
+    $Scanner.Unreadable | Select-Object -First 50
+    if ($Scanner.Unreadable.Count -gt 50) { "... and $($Scanner.Unreadable.Count - 50) more" }
+}
+else {
+    "None"
+}

@@ -43,11 +43,31 @@ param(
     # Warn this many days before the licence expiry date.
     [int]$LicenceWarnDays = 30,
 
+    # Maximum seconds any single ermm.exe call may run before it is killed.
+    # The script makes up to 5 ermm.exe calls, so worst case is roughly
+    # 5 x (30 + 5 s grace) = 175 s, safely under a 300 s Tactical timeout.
+    # Keeps the whole script well inside Tactical RMM's script timeout
+    # (Tactical reported "Script timed out after 300 seconds" on an affected machine).
+    [int]$ErmmTimeoutSeconds = 30,
+
     # Default behaviour: if ESET is not installed at all, PASS (exit 0) so the
     # check can be applied globally to every agent.
     # Add -RequireEset as a script argument on clients/policies where ESET
     # MUST be present, and a missing install becomes CRITICAL instead.
-    [switch]$RequireEset
+    [switch]$RequireEset,
+
+    # ESET products this check should NOT monitor (e.g. consumer NOD32 on a
+    # user's own licence). Each entry is a regex matched against the product
+    # name from the Windows uninstall entry and from ermm "application-info".
+    # Pass extra patterns from Tactical like: -ExcludeProducts 'NOD32','Smart Security'
+    [string[]]$ExcludeProducts = @('NOD32'),
+
+    # Uninstall DisplayNames used by ESET home products that do NOT include
+    # ermm.exe. EXACT match (not regex), and only acted on when no ermm.exe
+    # exists, so a business product can never be excluded by this.
+    # Evidence: NOD32 machine uninstall entry reported as 'ESET Security'
+    # (checked in Tactical terminal, 28 Sep 2026); NOD32 has no ermm.exe.
+    [string[]]$HomeProductNames = @('ESET Security')
 )
 
 # ---------------------------------------------------------------------------
@@ -77,6 +97,52 @@ $Info     = New-Object System.Collections.Generic.List[string]
 #                                               check can be applied globally,
 #                                               or CRITICAL with -RequireEset
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 0. Excluded products (checked first, before ermm.exe)
+#
+# WHY the uninstall registry: it is written by the product's own installer
+# and exists whether or not that product ships ermm.exe (ESET documents
+# ermm.exe for its business products; I found no documentation either way
+# for NOD32). Both 64-bit and 32-bit uninstall locations are read.
+# Only entries whose DisplayName or Publisher mentions ESET are considered,
+# so other vendors' software can never trigger the exclusion.
+# ---------------------------------------------------------------------------
+$UninstallPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+$EsetInstalls = @(Get-ItemProperty $UninstallPaths -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -match 'ESET' -or $_.Publisher -match 'ESET' })
+
+foreach ($pattern in $ExcludeProducts) {
+    $hit = $EsetInstalls | Where-Object { $_.DisplayName -match $pattern } | Select-Object -First 1
+    if ($hit) {
+        Write-Output "OK: '$($hit.DisplayName)' is excluded from this check (matched '$pattern') on $env:COMPUTERNAME."
+        exit 0
+    }
+}
+
+# Home-product rule (NOD32 and similar, no ermm.exe).
+# Both conditions must be true:
+#   a) an ESET uninstall entry's DisplayName EXACTLY equals a name in
+#      $HomeProductNames, and
+#   b) ermm.exe is absent from every known ESET product folder.
+# (b) is what stops a business product with a generic name being excluded:
+# every business product tested so far ships ermm.exe.
+$ErmmAnywhere = @(
+    "$env:ProgramFiles\ESET\ESET Security\ermm.exe",
+    "$env:ProgramFiles\ESET\ESET Server Security\ermm.exe",
+    "$env:ProgramFiles\ESET\ESET File Security\ermm.exe"
+) | Where-Object { Test-Path $_ }
+
+if (-not $ErmmAnywhere) {
+    $homeHit = $EsetInstalls | Where-Object { $HomeProductNames -contains $_.DisplayName } | Select-Object -First 1
+    if ($homeHit) {
+        Write-Output "OK: '$($homeHit.DisplayName)' $($homeHit.DisplayVersion) is an ESET home product without RMM support - excluded from this check on $env:COMPUTERNAME."
+        exit 0
+    }
+}
+
 $ProductFolders = @(
     "$env:ProgramFiles\ESET\ESET Security",
     "$env:ProgramFiles\ESET\ESET Server Security",
@@ -116,13 +182,83 @@ $Info.Add("ermm.exe found at: $Ermm")
 # (see the example outputs on the ESET pages listed above).
 # Returns $null if the call fails, so the caller can report it.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper: run ermm.exe with a hard time limit and return its text output.
+#
+# WHY: on an affected machine (24 Sep 2026) the script printed its full OK summary
+# but Tactical still reported "Script timed out after 300 seconds". The cause
+# is not yet known. Running ermm.exe through System.Diagnostics.Process lets
+# us stop waiting after $ErmmTimeoutSeconds, kill it, and record exactly which
+# command hung, instead of the whole check timing out with no explanation.
+#
+# Output is read asynchronously so that a process which keeps the output pipe
+# open cannot block us either; we only wait up to the timeout for it.
+# Returns the output string, or $null on timeout/launch failure (a warning is
+# recorded in both cases).
+# ---------------------------------------------------------------------------
+function Invoke-ErmmProcess {
+    param([string[]]$Arguments)
+
+    # Quote any argument containing a space (the date values do) so ermm.exe
+    # receives it as one argument, exactly as with the & call operator.
+    $argString = ($Arguments | ForEach-Object {
+        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+    }) -join ' '
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $Ermm
+    $psi.Arguments              = $argString
+    $psi.UseShellExecute        = $false   # required to capture output
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+
+    try {
+        [void]$proc.Start()
+
+        # Start reading both streams in the background immediately, so a full
+        # output buffer can never deadlock the process.
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        $timeoutMs = $ErmmTimeoutSeconds * 1000
+
+        if (-not $proc.WaitForExit($timeoutMs)) {
+            # ermm.exe itself did not finish in time: kill it and report.
+            try { $proc.Kill() } catch { }
+            $script:Warning.Add("ermm $argString did not finish within $ErmmTimeoutSeconds s and was stopped.")
+            return $null
+        }
+
+        # Process has exited; give the output readers a short grace period.
+        # If something else is still holding the pipe open, do not hang on it.
+        if (-not $outTask.Wait(5000)) {
+            $script:Warning.Add("ermm $argString exited but its output stream stayed open - output discarded.")
+            return $null
+        }
+        [void]$errTask.Wait(1000)
+
+        return ($outTask.Result + $errTask.Result).Trim()
+    }
+    catch {
+        $script:Warning.Add("ermm $argString could not be started: $($_.Exception.Message)")
+        return $null
+    }
+    finally {
+        $proc.Dispose()
+    }
+}
+
 function Invoke-Ermm {
     param([string[]]$Arguments)
 
     try {
         # Join output lines into one string because ConvertFrom-Json in
         # Windows PowerShell 5.1 needs the whole document, not line by line.
-        $raw = (& $Ermm @Arguments 2>&1 | Out-String).Trim()
+        $raw = Invoke-ErmmProcess $Arguments
         if (-not $raw) { return $null }
 
         $json = $raw | ConvertFrom-Json -ErrorAction Stop
@@ -141,6 +277,36 @@ function Invoke-Ermm {
         $script:Warning.Add("ermm $($Arguments -join ' ') failed or gave non-JSON output: $raw")
         return $null
     }
+}
+
+# ---------------------------------------------------------------------------
+# Second exclusion check using ESET's own product name.
+# ESET documents 'get application-info' returning "description" (e.g.
+# "ESET Endpoint Antivirus") and "product" (e.g. "eea").
+# Source: https://help.eset.com/eea/12/en-US/rmm_json_commands_application.html
+# This catches an excluded product whose uninstall entry was missed above.
+# ---------------------------------------------------------------------------
+# Called quietly (no warning if it fails): this is only a secondary exclusion
+# check, and I have not confirmed application-info is permitted under
+# "Safe operations only", so a refusal here must not raise a false warning.
+$appInfo = $null
+try {
+    $appRaw = Invoke-ErmmProcess @('get', 'application-info')
+    if ($appRaw) {
+        $appJson = $appRaw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $appJson.error) { $appInfo = $appJson.result }
+    }
+}
+catch { $appInfo = $null }
+
+if ($appInfo) {
+    foreach ($pattern in $ExcludeProducts) {
+        if ($appInfo.description -match $pattern) {
+            Write-Output "OK: '$($appInfo.description)' is excluded from this check (matched '$pattern') on $env:COMPUTERNAME."
+            exit 0
+        }
+    }
+    $Info.Add("Product: $($appInfo.description) $($appInfo.version) (product code '$($appInfo.product)')")
 }
 
 # ---------------------------------------------------------------------------
@@ -249,12 +415,12 @@ if ($act) {
 # 5. Detections (virlog) in the lookback window
 #
 # EVIDENCE (live testing, 23 Sep 2026):
-#   - STEVE-WIN11: 'get logs --name virlog' with a date range that CONTAINS
+#   - test machine A: 'get logs --name virlog' with a date range that CONTAINS
 #     detections (2026-09-01 to 2026-09-02) returned them correctly, so
 #     ESET's date filtering works.
-#   - STEVE-WIN11: every date range with NO matching entries (2017 dates,
+#   - test machine A: every date range with NO matching entries (2017 dates,
 #     22-23 Sep 2026) returned error id 3 "General error executing command".
-#   - W2019114: 'get logs --name warnlog' (no dates) worked, but
+#   - test machine B: 'get logs --name warnlog' (no dates) worked, but
 #     'get logs --name virlog' (no dates) returned error id 3.
 #   => Observed pattern: error 3 is returned when the query has no entries.
 #      ESET does not document this, so the script only treats error 3 as
@@ -297,7 +463,7 @@ function ConvertFrom-EsetTime {
 function Invoke-ErmmRaw {
     param([string[]]$Arguments)
     try {
-        $raw = (& $Ermm @Arguments 2>&1 | Out-String).Trim()
+        $raw = Invoke-ErmmProcess $Arguments
         if (-not $raw) { return $null }
         return ($raw | ConvertFrom-Json -ErrorAction Stop)
     }
@@ -338,7 +504,7 @@ elseif ($resp.error.id -eq 3) {
     }
     elseif ($full -and $full.error.id -eq 3) {
         # Whole log also returns error 3 -> treated as an EMPTY Detections log
-        # (observed behaviour on W2019114, not documented by ESET).
+        # (observed behaviour on test machine B, not documented by ESET).
         $Info.Add("Detections log is empty (ESET returned error 3 for both the window and the full log).")
     }
     else {

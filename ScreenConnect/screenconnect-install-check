@@ -18,7 +18,7 @@
       2. Company - The company ScreenConnect itself holds for this machine (what the
                    console shows) is compared with the expected company, ignoring
                    upper/lower case. A script on the machine cannot ask the
-                   ScreenConnect server, so the bridge does: on a schedule it reads every
+                   ScreenConnect server, so the sync job does: on a schedule it reads every
                    machine's Company from ScreenConnect and writes it into the TRMM agent
                    custom field "ScreenConnectCompanyActual". TRMM hands that value to
                    this script as -ActualCompany.
@@ -26,8 +26,8 @@
     WHY NOT THE VALUE ON THE MACHINE
       The client keeps the launch string it was installed with in its service's
       ImagePath, and the first c= in it is the company it was INSTALLED under. That
-      value never changes afterwards. Proven 2026-10-09 on BIFL-PC-2348: the machine
-      still said 'Bifrangi UK Ltd' while the console said 'Bifrangi'. Comparing it gave
+      value never changes afterwards. Proven 2026-10-09 on one machine: the machine
+      still said 'Example UK Ltd' while the console said 'Example'. Comparing it gave
       a false "wrong company". It is still printed ("Installed as") because it is useful
       to see, but it is never compared and never fails the check.
 
@@ -37,12 +37,12 @@
       ScreenConnect needs a site value - every other site, including any new one added
       later, simply inherits its client's company.
 
-    WHAT THE BRIDGE WRITES INTO THE AGENT FIELD
+    WHAT THE SYNC JOB WRITES INTO THE AGENT FIELD
       the company     the machine's Company in ScreenConnect       -> compared
       (blank)         the machine is in ScreenConnect with NO Company -> reported as wrong
-      nothing         the bridge has not matched this machine yet (new machine, or no
+      nothing         the sync job has not matched this machine yet (new machine, or no
                       record found)                                  -> not compared, passes
-      So a brand new machine does not alert in the gap before the bridge's next run.
+      So a brand new machine does not alert in the gap before the sync job's next run.
       The answer is only as fresh as that last run.
 
     This script only REPORTS. It never installs, starts, stops or changes anything.
@@ -88,7 +88,7 @@
     the service is checked.
 
 .PARAMETER ActualCompany
-    The Company ScreenConnect holds for this machine, as recorded by the bridge. In a TRMM
+    The Company ScreenConnect holds for this machine, as recorded by the sync job. In a TRMM
     check, pass the agent's custom field:
     -ActualCompany {{agent.ScreenConnectCompanyActual}}
 
@@ -179,9 +179,9 @@ if ($siteValue)       { $expected = $siteValue;   $expectedFrom = 'site' }
 elseif ($clientValue) { $expected = $clientValue; $expectedFrom = 'client' }
 else                  { $expected = '';           $expectedFrom = '' }
 
-# What ScreenConnect holds for this machine, as last recorded by the bridge.
+# What ScreenConnect holds for this machine, as last recorded by the sync job.
 #   ''           = nothing recorded (field empty, or TRMM passed the placeholder through)
-#   '(blank)'    = the bridge found the machine in ScreenConnect with no Company at all
+#   '(blank)'    = the sync job found the machine in ScreenConnect with no Company at all
 #   anything else = the Company
 $actual = Get-CleanValue $ActualCompany
 $actualIsBlank = ($actual -ieq '(blank)')
@@ -212,7 +212,7 @@ if ($service) {
 
     # The comparison. Only when: the client is installed (a missing client is the Installed
     # check's business), this run is not Installed-only, an expected company was supplied,
-    # and the bridge has recorded something for this machine.
+    # and the sync job has recorded something for this machine.
     if ($expected -and ($Mode -ne 'Installed') -and $actual) {
         if ($actualIsBlank) {
             $warnings.Add("ScreenConnect has this machine with NO company. This $expectedFrom should be '$expected'.")
@@ -230,8 +230,8 @@ Write-Output "Mode    : $Mode"
 if ($service)           { Write-Output "Service : $($service.Name)" }
 if ($Mode -ne 'Installed') {
     if ($actualIsBlank) { Write-Output 'Company : (none set in ScreenConnect)' }
-    elseif ($actual)    { Write-Output "Company : $actual (in ScreenConnect, as last recorded by the bridge)" }
-    else                { Write-Output 'Company : (nothing recorded by the bridge for this machine yet)' }
+    elseif ($actual)    { Write-Output "Company : $actual (in ScreenConnect, as last recorded by the sync job)" }
+    else                { Write-Output 'Company : (nothing recorded by the sync job for this machine yet)' }
 }
 # Shown for information only; never compared.
 if ($null -ne $installedAs) { Write-Output "Installed as: $(if ($installedAs) { $installedAs } else { '(no company at install)' })" }
@@ -263,6 +263,6 @@ Write-Output ''
 if (-not $service)             { Write-Output 'OK for this check: ScreenConnect is NOT installed, so there is no company to compare. The Installed check reports that.' }
 elseif ($Mode -eq 'Installed') { Write-Output 'OK: ScreenConnect is installed.' }
 elseif (-not $expected)        { Write-Output 'OK: ScreenConnect is installed. No expected company was supplied, so the company was not compared.' }
-elseif (-not $actual)          { Write-Output 'OK: ScreenConnect is installed. The bridge has not recorded a company for this machine yet, so the company was not compared.' }
+elseif (-not $actual)          { Write-Output 'OK: ScreenConnect is installed. The sync job has not recorded a company for this machine yet, so the company was not compared.' }
 else                           { Write-Output 'OK: ScreenConnect is installed and is under the expected company in ScreenConnect.' }
 Complete-Check 0
