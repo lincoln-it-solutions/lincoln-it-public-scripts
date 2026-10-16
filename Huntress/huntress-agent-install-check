@@ -1,49 +1,126 @@
 <#
 .SYNOPSIS
-    Checks whether the Huntress Agent is installed on this machine.
+    TRMM script check: is Huntress actually installed, registered and running?
+    Replaces checks that only looked for C:\Program Files\Huntress.
 
 .DESCRIPTION
-    Looks for HuntressAgent.exe in both possible install locations
-    (64-bit "Program Files" and 32-bit "Program Files (x86)").
-    Outputs SUCCESS and exits 0 if either path is found.
-    Outputs FAILURE and exits 1 if neither path is found.
+    Install/running checks only - does NOT look at Huntress alerts, incidents or the
+    agent's health status.
 
-    Exit codes are set deliberately so this script can be dropped
-    straight into an RMM tool (e.g. Datto RMM, NinjaOne, etc.) as a
-    monitor/check component - most RMM platforms treat exit code 0
-    as "pass" and any non-zero code as "fail".
+      1. Services     - HuntressAgent + HuntressUpdater must exist AND be Running.
+                        HuntressRio (EDR) must also be Running on OS kernel 6.2+ (Win8/2012+).
+                        Service names + the 6.2 rule come from Huntress's own install script
+                        (huntresslabs/deployment-scripts, InstallHuntress.powershellv2.ps1).
+      2. Registration - HKLM\SOFTWARE\Huntress Labs\Huntress must hold a non-zero AgentId.
+                        Huntress's install script treats a missing / zero AgentId as
+                        "the agent did not register" (installed but not linked to the portal).
+
+    Exit codes (TRMM: any non-zero = failing; add 2 to the check's "Warning return codes"
+    so it alerts as Warning instead of Error - confirmed in TRMM source checks/models.py):
+      0 = installed, registered, all services running
+      1 = FAIL (not installed / leftover folders only / service stopped / not registered)
+      2 = WARN (Rio not present yet on an install less than NewInstallGraceHours old)
+
+.PARAMETER NewInstallGraceHours
+    Huntress states Rio (EDR) can take up to 24h to appear after a fresh install. If Rio is
+    missing and HuntressAgent.exe is younger than this, return WARN instead of FAIL.
 #>
-
-# Define both known install paths for HuntressAgent.exe.
-# Using an array so we only have to loop/check once rather than
-# duplicating the "if exists" logic twice.
-$huntressPaths = @(
-    "C:\Program Files\Huntress\HuntressAgent.exe",
-    "C:\Program Files (x86)\Huntress\HuntressAgent.exe"
+param(
+    [int]$NewInstallGraceHours = 24
 )
 
-# Track which path(s) actually exist so we can report exactly what was found.
-$foundPaths = foreach ($path in $huntressPaths) {
-    # Test-Path is used rather than Get-Item so a missing path doesn't throw an error.
-    if (Test-Path -Path $path -PathType Leaf) {
-        $path
+# Collect every problem rather than stopping at the first, so the TRMM check output
+# shows the full picture in one run.
+$failures = New-Object System.Collections.Generic.List[string]
+$warnings = New-Object System.Collections.Generic.List[string]
+
+# TRMM docs: set PowerShell exit codes via $host.SetShouldExit(); exit stops the script.
+function Complete-Check([int]$code) {
+    $host.SetShouldExit($code)
+    exit $code
+}
+
+# ---------------------------------------------------------------------------
+# 1. SERVICES
+# ---------------------------------------------------------------------------
+# Kernel version decides whether Rio is expected. Huntress's installer skips the Rio
+# check below 6.2 because legacy OSes can't run Huntress EDR.
+$osVersion   = [Environment]::OSVersion.Version
+$rioExpected = ($osVersion -ge [Version]'6.2')
+
+$required = @('HuntressAgent', 'HuntressUpdater')
+if ($rioExpected) { $required += 'HuntressRio' }
+
+foreach ($name in $required) {
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+
+    if (-not $svc) {
+        # Rio missing on a brand-new install is expected for up to 24h, so downgrade
+        # to WARN inside the grace window.
+        if ($name -eq 'HuntressRio') {
+            $agentExe = Join-Path $env:ProgramFiles 'Huntress\HuntressAgent.exe'
+            if ((Test-Path $agentExe) -and
+                ((Get-Item $agentExe).CreationTime -gt (Get-Date).AddHours(-$NewInstallGraceHours))) {
+                $warnings.Add("HuntressRio not present yet - agent installed < $NewInstallGraceHours h ago (Huntress says EDR can take up to 24h).")
+                continue
+            }
+        }
+        $failures.Add("Service '$name' is NOT installed.")
+        continue
+    }
+
+    if ($svc.Status -ne 'Running') {
+        $failures.Add("Service '$name' exists but is $($svc.Status) (StartType: $($svc.StartType)).")
+    }
+    else {
+        Write-Output "OK   Service '$name' running."
     }
 }
 
-# If $foundPaths has at least one entry, Huntress is installed.
-if ($foundPaths) {
-    Write-Output "SUCCESS: Huntress Agent found."
-    foreach ($path in $foundPaths) {
-        Write-Output "  Found: $path"
+# ---------------------------------------------------------------------------
+# 2. REGISTRATION (registry)
+# ---------------------------------------------------------------------------
+# Open the 64-bit registry view explicitly. Huntress's own script warns it can't verify
+# these keys from 32-bit PowerShell on a 64-bit host (WOW64 redirection), so we don't
+# rely on whichever bitness TRMM happens to launch.
+try {
+    $view = if ([Environment]::Is64BitOperatingSystem) { [Microsoft.Win32.RegistryView]::Registry64 } else { [Microsoft.Win32.RegistryView]::Registry32 }
+    $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+    $key  = $hklm.OpenSubKey('SOFTWARE\Huntress Labs\Huntress')
+
+    if (-not $key) {
+        $failures.Add("Registry key HKLM\SOFTWARE\Huntress Labs\Huntress missing - agent never registered or was removed.")
     }
-    # Exit 0 = success, so RMM tools/schedulers treat this as a pass.
-    exit 0
-}
-else {
-    Write-Output "FAILURE: Huntress Agent not found at either expected location:"
-    foreach ($path in $huntressPaths) {
-        Write-Output "  Missing: $path"
+    else {
+        $agentId = $key.GetValue('AgentId')
+
+        # Huntress's installer: AgentId of 0 / missing = "The agent did not register".
+        if ($null -eq $agentId -or "$agentId" -eq '0' -or "$agentId" -eq '') {
+            $failures.Add("AgentId is missing/0 - agent is NOT registered with the Huntress portal.")
+        }
+        else {
+            Write-Output "OK   Registered. AgentId=$agentId"
+        }
+        $key.Close()
     }
-    # Exit 1 = failure, so RMM tools/schedulers flag this as an alert.
-    exit 1
 }
+catch {
+    $failures.Add("Could not read Huntress registry: $($_.Exception.Message)")
+}
+
+# ---------------------------------------------------------------------------
+# RESULT
+# ---------------------------------------------------------------------------
+# Call out the "folder exists but nothing running" case that was passing the old
+# checks, so it's obvious in the alert text.
+if ($failures.Count -gt 0 -and (Test-Path (Join-Path $env:ProgramFiles 'Huntress'))) {
+    $failures.Add("NOTE: '$env:ProgramFiles\Huntress' folder exists - likely a broken / partially removed install.")
+}
+
+foreach ($f in $failures) { Write-Output "FAIL $f" }
+foreach ($w in $warnings) { Write-Output "WARN $w" }
+
+if ($failures.Count -gt 0) { Complete-Check 1 }
+if ($warnings.Count -gt 0) { Complete-Check 2 }
+Write-Output "Huntress installed and running."
+Complete-Check 0

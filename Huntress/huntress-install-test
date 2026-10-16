@@ -1,0 +1,172 @@
+<#
+.SYNOPSIS
+    Read-only Huntress pre-deployment test for TRMM. Combines the certificate
+    interception test and the installer download test into one run.
+
+.DESCRIPTION
+    PART 1 - Certificate test (same 3 hosts + same SslStream method as Huntress's
+             InstallHuntress.powershellv2.ps1 "Testing Certificate Validation"; host list
+             from huntresslabs/support URLdata.json "array2").
+             Unlike Huntress's script, each host is wrapped in try/catch, so a dropped
+             handshake (e.g. WSAECONNABORTED 10053) is reported per host instead of
+             killing the whole run.
+
+    PART 2 - Installer download (same URL, WebClient and TLS settings as Huntress's
+             Get-Installer), plus: every redirect hop with the certificate issuer it
+             presented, download time/size, and Huntress's Authenticode signature check.
+
+    Interception is flagged when an issuer is NOT one of the real CAs these hosts use
+    (DigiCert, Google Trust Services, Microsoft, Amazon), so it catches any vendor
+    (ESET, Sophos, Fortinet...), not just ESET.
+
+    Installs nothing. Deletes its own test download afterwards.
+
+    Exit codes (TRMM): 0 = all passed, 1 = at least one problem found.
+
+.PARAMETER AccountKey
+    Huntress account key, needed for the download test. Pass as a TRMM script
+    argument:  -AccountKey xxxxxxxx
+    If omitted, only Part 1 runs.
+#>
+param(
+    [string]$AccountKey
+)
+
+$problems = 0   # anything non-zero -> exit 1 so TRMM shows the run as failed
+
+# Real issuing CAs seen for these hosts (Huntress URLdata.json array5 + Amazon for S3).
+# Anything else presenting a certificate for these hosts is treated as interception.
+$trustedIssuers = 'DigiCert', 'Google Trust Services', 'Microsoft Corporation', 'O=Amazon'
+
+function Test-Issuer([string]$issuer) {
+    # True if the issuer matches one of the genuine CAs above
+    foreach ($t in $trustedIssuers) { if ($issuer -like "*$t*") { return $true } }
+    return $false
+}
+
+# Match Huntress's download step: TLS 1.3 + 1.2 (enum values 12288 and 3072)
+[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 12288) -bor [Enum]::ToObject([Net.SecurityProtocolType], 3072)
+
+# ===========================================================================
+# PART 1 - CERTIFICATE TEST
+# ===========================================================================
+Write-Output "===== PART 1: Certificate test (hosts Huntress's installer checks) ====="
+$certHosts = @('www.huntress.io', 'huntresscdn.com', 'huntressedrue2.blob.core.windows.net')
+
+foreach ($h in $certHosts) {
+    $tcp = $null; $ssl = $null
+    try {
+        # Raw TCP + SslStream exactly like Huntress's script. The {$true} callback
+        # accepts any cert so we can SEE what was presented instead of just failing.
+        $tcp = New-Object Net.Sockets.TcpClient
+        $tcp.Connect($h, 443)
+        $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, { $true })
+        $ssl.AuthenticateAsClient($h)
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $ssl.RemoteCertificate
+
+        if (Test-Issuer $cert.Issuer) {
+            Write-Output "[OK]          $h"
+        } else {
+            Write-Output "[INTERCEPTED] $h"
+            $problems++
+        }
+        Write-Output "   Subject : $($cert.Subject)"
+        Write-Output "   Issuer  : $($cert.Issuer)"
+        Write-Output "   Valid to: $($cert.NotAfter)"
+    }
+    catch {
+        # This is where Huntress's own script dies with "connection was aborted by the
+        # software in your host machine" - here we record it and carry on.
+        $msg = $_.Exception.Message
+        if ($_.Exception.InnerException) { $msg += " | " + $_.Exception.InnerException.Message }
+        Write-Output "[HANDSHAKE FAILED] $h -> $msg"
+        $problems++
+    }
+    finally {
+        if ($ssl) { $ssl.Dispose() }
+        if ($tcp) { $tcp.Dispose() }
+    }
+}
+
+# ===========================================================================
+# PART 2 - INSTALLER DOWNLOAD TEST
+# ===========================================================================
+Write-Output ""
+Write-Output "===== PART 2: Installer download test ====="
+
+if ([string]::IsNullOrWhiteSpace($AccountKey)) {
+    Write-Output "SKIPPED - no -AccountKey argument supplied."
+}
+else {
+    $url  = "https://update.huntress.io/download/$($AccountKey.Trim())/HuntressInstaller.exe"
+    $dest = Join-Path $env:TEMP 'HuntressInstaller-connectivitytest.exe'
+
+    # --- 2a. Walk the redirect chain so every host the download touches is visible.
+    # GET with a 1-byte Range request (not HEAD): the S3 redirect is a signed link
+    # meant for GET, so a HEAD there returns a misleading 403.
+    $hop = $url
+    for ($i = 1; $i -le 5; $i++) {
+        $req = [Net.HttpWebRequest]::Create($hop)
+        $req.Method = 'GET'
+        $req.AddRange(0, 0)
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = 30000      # 30s so a stuck hop is reported, not hung
+        $resp = $null
+        try {
+            $resp = $req.GetResponse()
+        } catch [Net.WebException] {
+            $resp = $_.Exception.Response   # 3xx/4xx still carry a response
+            if (-not $resp) {
+                Write-Output "HOP $i $(([uri]$hop).Host) -> ERROR: $($_.Exception.Message)"
+                $problems++
+                break
+            }
+        }
+
+        $issuer = if ($req.ServicePoint.Certificate) { $req.ServicePoint.Certificate.Issuer } else { 'n/a' }
+        $flag   = if ($issuer -eq 'n/a' -or (Test-Issuer $issuer)) { 'OK' } else { $problems++; 'INTERCEPTED' }
+        $code   = [int]$resp.StatusCode
+        Write-Output "HOP $i [$flag] $(([uri]$hop).Host) -> HTTP $code | issuer: $issuer"
+
+        $next = $resp.Headers['Location']
+        $resp.Close()
+        if ($code -ge 300 -and $code -lt 400 -and $next) {
+            $hop = ([uri]::new([uri]$hop, $next)).AbsoluteUri   # handle relative redirects
+        } else { break }
+    }
+
+    # --- 2b. The real download, same client as Huntress (WebClient, no own timeout),
+    # timed so a slow/inspected download is obvious.
+    Remove-Item $dest -Force -ErrorAction SilentlyContinue
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        (New-Object Net.WebClient).DownloadFile($url, $dest)
+        $sw.Stop()
+        Write-Output ("DOWNLOAD OK in {0:N1}s, {1:N0} bytes" -f $sw.Elapsed.TotalSeconds, (Get-Item $dest).Length)
+
+        # --- 2c. Huntress's verifyInstaller equivalent: file must be validly signed
+        $sig = Get-AuthenticodeSignature -FilePath $dest
+        Write-Output "SIGNATURE: $($sig.Status) | signer: $($sig.SignerCertificate.Subject)"
+        if ($sig.Status -ne 'Valid') { $problems++ }
+    }
+    catch {
+        $sw.Stop()
+        Write-Output ("DOWNLOAD FAILED after {0:N1}s: {1}" -f $sw.Elapsed.TotalSeconds, $_.Exception.Message)
+        $problems++
+    }
+    finally {
+        Remove-Item $dest -Force -ErrorAction SilentlyContinue   # tidy up test file
+    }
+}
+
+# ===========================================================================
+# RESULT
+# ===========================================================================
+Write-Output ""
+if ($problems -eq 0) {
+    Write-Output "RESULT: PASS - ready for Huntress deployment."
+    $host.SetShouldExit(0); exit 0
+} else {
+    Write-Output "RESULT: $problems problem(s) found - see lines marked INTERCEPTED / FAILED above."
+    $host.SetShouldExit(1); exit 1
+}
