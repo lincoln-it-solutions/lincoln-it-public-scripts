@@ -18,7 +18,14 @@
       0 = OK
       1 = Warning  (needs a look, not urgent)
       2 = Critical (action required)
-      3 = Script could not query ESET (e.g. RMM interface disabled)
+      3 = Info: ESET is managed (ESET Management Agent installed) but its RMM
+          interface (ermm.exe) is not answering, so health can't be read
+
+    Unmanaged machines: ESET installed WITHOUT the ESET Management Agent is not
+    ours to monitor, so the check passes (exit 0) whatever ermm.exe says.
+
+    Exit codes reach Tactical RMM unchanged via Stop-Check (see below). Before
+    2026-10-25 a plain "exit 2" arrived as 1, so every result looked the same.
 
 .PREREQUISITE
     ESET RMM is DISABLED by default. Enable it (ideally via an ESET PROTECT policy):
@@ -74,6 +81,20 @@ param(
 # Result collectors. Every finding is added to one of these lists so the
 # script can print a single readable summary and pick one exit code at the end.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Exit code helper.
+# WHY: the Tactical RMM Windows agent runs scripts as
+#   powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass <file>
+# without -File, so a plain "exit 2" reaches TRMM as 1. SetShouldExit passes
+# the real code through - tested via a TRMM script check on Steve-Win11
+# 2026-10-20: plain exit 2 -> 1, SetShouldExit(2) -> 2. (Same helper as the
+# backup monitoring scripts.)
+# ---------------------------------------------------------------------------
+function Stop-Check([int]$Code) {
+    $host.SetShouldExit($Code)
+    exit $Code
+}
+
 $Critical = New-Object System.Collections.Generic.List[string]
 $Warning  = New-Object System.Collections.Generic.List[string]
 $Info     = New-Object System.Collections.Generic.List[string]
@@ -118,7 +139,7 @@ foreach ($pattern in $ExcludeProducts) {
     $hit = $EsetInstalls | Where-Object { $_.DisplayName -match $pattern } | Select-Object -First 1
     if ($hit) {
         Write-Output "OK: '$($hit.DisplayName)' is excluded from this check (matched '$pattern') on $env:COMPUTERNAME."
-        exit 0
+        Stop-Check 0
     }
 }
 
@@ -139,7 +160,7 @@ if (-not $ErmmAnywhere) {
     $homeHit = $EsetInstalls | Where-Object { $HomeProductNames -contains $_.DisplayName } | Select-Object -First 1
     if ($homeHit) {
         Write-Output "OK: '$($homeHit.DisplayName)' $($homeHit.DisplayVersion) is an ESET home product without RMM support - excluded from this check on $env:COMPUTERNAME."
-        exit 0
+        Stop-Check 0
     }
 }
 
@@ -148,6 +169,29 @@ $ProductFolders = @(
     "$env:ProgramFiles\ESET\ESET Server Security",
     "$env:ProgramFiles\ESET\ESET File Security"
 )
+
+# ---------------------------------------------------------------------------
+# Unmanaged rule: ESET product present but no ESET Management Agent -> OK.
+# WHY: the Management Agent is what connects a machine to our ESET PROTECT
+# console. Without it the install isn't one we manage (e.g. a client's own
+# licence), so we don't alert on it - even if ermm.exe reports problems.
+# Agent names are the uninstall DisplayNames seen in TRMM software inventory
+# 2026-10-25: "ESET Management Agent" (current) and "ESET Remote
+# Administrator Agent" (older 6.x name).
+# ---------------------------------------------------------------------------
+$AgentNamePattern = '^ESET (Management|Remote Administrator) Agent'
+$MgmtAgent = $EsetInstalls | Where-Object { $_.DisplayName -match $AgentNamePattern } | Select-Object -First 1
+
+# "Product present" = ermm.exe or any ESET product folder exists.
+$ProductPresent = [bool]$ErmmAnywhere -or [bool]($ProductFolders | Where-Object { Test-Path $_ })
+
+if ($ProductPresent -and -not $MgmtAgent) {
+    # Product name/version from the uninstall entries, for the record (agents excluded).
+    $prod = $EsetInstalls | Where-Object { $_.DisplayName -notmatch $AgentNamePattern } | Select-Object -First 1
+    Write-Output "OK: ESET is unmanaged on $env:COMPUTERNAME (no ESET Management Agent installed) - not monitored."
+    if ($prod) { Write-Output "  [INFO] Product: $($prod.DisplayName) $($prod.DisplayVersion)" }
+    Stop-Check 0
+}
 
 # Build the ermm.exe path for each product folder.
 $CandidatePaths = $ProductFolders | ForEach-Object { Join-Path $_ 'ermm.exe' }
@@ -161,18 +205,18 @@ if (-not $Ermm) {
         # Case b: product folder present but ermm.exe missing.
         Write-Output "CRITICAL: ESET product folder found but ermm.exe is missing - installation damaged or partly removed."
         Write-Output "Found: $($FoundFolders -join '; ')"
-        exit 2
+        Stop-Check 2
     }
 
     # Case c: no ESET product installed.
     if ($RequireEset) {
         Write-Output "CRITICAL: ESET is not installed on $env:COMPUTERNAME (this check was run with -RequireEset)."
         Write-Output "Checked: $($ProductFolders -join '; ')"
-        exit 2
+        Stop-Check 2
     }
 
     Write-Output "OK: ESET not installed on $env:COMPUTERNAME - nothing to monitor."
-    exit 0
+    Stop-Check 0
 }
 $Info.Add("ermm.exe found at: $Ermm")
 
@@ -303,7 +347,7 @@ if ($appInfo) {
     foreach ($pattern in $ExcludeProducts) {
         if ($appInfo.description -match $pattern) {
             Write-Output "OK: '$($appInfo.description)' is excluded from this check (matched '$pattern') on $env:COMPUTERNAME."
-            exit 0
+            Stop-Check 0
         }
     }
     $Info.Add("Product: $($appInfo.description) $($appInfo.version) (product code '$($appInfo.product)')")
@@ -324,11 +368,17 @@ $prot = Invoke-Ermm @('get', 'protection-status')
 
 if ($null -eq $prot) {
     # If we cannot even read protection status, the monitor is blind.
-    Write-Output "UNKNOWN: Could not query ESET protection status."
-    Write-Output "Most likely cause: ESET RMM is disabled (it is off by default) or the"
-    Write-Output "authorization method blocks this caller. See script header."
+    # Managed machine (agent present, checked above) whose RMM interface won't answer:
+    # report as Info (exit 3), not a failure, with the product and agent versions.
+    # 2026-10-25: 175 workstations gave error 3 "General error executing command";
+    # all 40 sampled run ESET Endpoint 13.1.2036.0 (sampled healthy ones run 13.0.x).
+    $prod = $EsetInstalls | Where-Object { $_.DisplayName -notmatch $AgentNamePattern } | Select-Object -First 1
+    Write-Output "INFO: ESET is managed on $env:COMPUTERNAME but its RMM interface (ermm.exe) is not answering - health can't be read."
+    if ($prod) { Write-Output "  Product: $($prod.DisplayName) $($prod.DisplayVersion)" }
+    Write-Output "  Management Agent: $($MgmtAgent.DisplayName) $($MgmtAgent.DisplayVersion)"
+    Write-Output "  Check ESET RMM is enabled in the ESET PROTECT policy (Tools > ESET RMM)."
     $Warning | ForEach-Object { Write-Output "  $_" }
-    exit 3
+    Stop-Check 3
 }
 
 foreach ($s in $prot.statuses) {
@@ -585,16 +635,16 @@ if ($Critical.Count -gt 0) {
     $Critical | ForEach-Object { Write-Output "  [CRIT] $_" }
     $Warning  | ForEach-Object { Write-Output "  [WARN] $_" }
     $Info     | ForEach-Object { Write-Output "  [INFO] $_" }
-    exit 2
+    Stop-Check 2
 }
 elseif ($Warning.Count -gt 0) {
     Write-Output "WARNING: $($Warning.Count) finding(s) on $env:COMPUTERNAME"
     $Warning | ForEach-Object { Write-Output "  [WARN] $_" }
     $Info    | ForEach-Object { Write-Output "  [INFO] $_" }
-    exit 1
+    Stop-Check 1
 }
 else {
     Write-Output "OK: ESET healthy on $env:COMPUTERNAME"
     $Info | ForEach-Object { Write-Output "  [INFO] $_" }
-    exit 0
+    Stop-Check 0
 }
