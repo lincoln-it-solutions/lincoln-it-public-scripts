@@ -1,0 +1,110 @@
+<#
+.SYNOPSIS
+    Read-only: reports which ESET licence this machine is activated with.
+
+.DESCRIPTION
+    Used by eset_licence_fields.py ("census" mode) to find out which ESET
+    licence public ID each machine is currently on, so the per-client
+    "ESET Licence" custom field can be filled in and checked against reality.
+
+    It runs ESET's own RMM tool, ermm.exe, with:
+        ermm.exe get license-info
+    which ESET documents as returning type, expiration_date, expiration_state,
+    public_id, seat_id and seat_name:
+    https://help.eset.com/ees/13/en-US/rmm_json_commands_license.html
+
+    Our 2026-10-25 work showed MSP seats lay this JSON out differently
+    (expiry sits under "edtd"), so this script does NOT assume where
+    public_id lives - it searches the whole JSON reply for it.
+
+    It changes nothing on the machine. It always prints exactly one line of
+    JSON so the Python side can parse it, and always exits 0 (a census run
+    should never raise TRMM alerts).
+
+.NOTES
+    Add to TRMM as a PowerShell script, e.g. named "ESET - Get Licence Info".
+    No arguments.
+#>
+
+# Stop on errors inside try blocks so we can catch them and report cleanly.
+$ErrorActionPreference = 'Stop'
+
+# Helper: write the single JSON result line and exit 0.
+# Depth 10 so nested ESET JSON isn't truncated by ConvertTo-Json's default depth of 2.
+function Write-Result {
+    param([hashtable]$Data)
+    $Data['hostname'] = $env:COMPUTERNAME
+    Write-Output ($Data | ConvertTo-Json -Compress -Depth 10)
+    exit 0
+}
+
+# Helper: walk any object returned by ConvertFrom-Json and return the first
+# value found under a property called $Name, however deeply nested.
+# Needed because the MSP layout of license-info isn't documented.
+function Find-JsonValue {
+    param($Node, [string]$Name)
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [System.Management.Automation.PSCustomObject]) {
+        foreach ($p in $Node.PSObject.Properties) {
+            if ($p.Name -eq $Name -and $p.Value -isnot [System.Management.Automation.PSCustomObject]) {
+                return $p.Value
+            }
+            $found = Find-JsonValue -Node $p.Value -Name $Name
+            if ($null -ne $found) { return $found }
+        }
+    }
+    elseif ($Node -is [System.Collections.IEnumerable] -and $Node -isnot [string]) {
+        foreach ($item in $Node) {
+            $found = Find-JsonValue -Node $item -Name $Name
+            if ($null -ne $found) { return $found }
+        }
+    }
+    return $null
+}
+
+# 1. Find ermm.exe. We search the ESET folders rather than hard-coding one
+#    product path, because Endpoint Security / Endpoint Antivirus / Server
+#    Security install to different sub-folders.
+$searchRoots = @("$env:ProgramFiles\ESET", "${env:ProgramFiles(x86)}\ESET") | Where-Object { $_ -and (Test-Path $_) }
+$ermm = $null
+foreach ($root in $searchRoots) {
+    $ermm = Get-ChildItem -Path $root -Filter 'ermm.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($ermm) { break }
+}
+if (-not $ermm) {
+    Write-Result @{ status = 'no_ermm'; detail = 'ermm.exe not found under Program Files\ESET (ESET not installed, or a product without ESET RMM)' }
+}
+
+# 2. Run "get license-info" as a background job so a hung ermm can't hold
+#    the TRMM script slot forever (we have seen "get application-info" hang).
+$job = Start-Job -ScriptBlock { param($exe) & $exe get license-info 2>&1 | Out-String } -ArgumentList $ermm.FullName
+if (-not (Wait-Job $job -Timeout 25)) {
+    Stop-Job $job; Remove-Job $job -Force
+    Write-Result @{ status = 'timeout'; detail = 'ermm get license-info did not answer within 25 s'; ermm = $ermm.FullName }
+}
+$raw = Receive-Job $job; Remove-Job $job -Force
+
+# 3. Parse the reply. ESET returns {"id":..,"result":{..},"error":null|{..}}.
+try {
+    $json = $raw | ConvertFrom-Json
+}
+catch {
+    Write-Result @{ status = 'bad_json'; detail = 'ermm reply was not JSON'; raw = $raw.Trim() }
+}
+
+# ESET reports failures in the "error" object (e.g. id 6 = RMM disabled).
+if ($null -ne $json.error) {
+    Write-Result @{ status = 'ermm_error'; error_id = $json.error.id; detail = $json.error.text; raw = $raw.Trim() }
+}
+
+# 4. Pull out the fields we care about, wherever they are in the reply.
+$publicId = Find-JsonValue -Node $json.result -Name 'public_id'
+Write-Result @{
+    status           = $(if ($publicId) { 'ok' } else { 'no_public_id' })
+    public_id        = $publicId
+    type             = Find-JsonValue -Node $json.result -Name 'type'
+    seat_name        = Find-JsonValue -Node $json.result -Name 'seat_name'
+    expiration_state = Find-JsonValue -Node $json.result -Name 'expiration_state'
+    # Raw reply kept so we can see the real MSP layout the first time we run it.
+    raw              = $raw.Trim()
+}
