@@ -74,7 +74,12 @@ param(
     # exists, so a business product can never be excluded by this.
     # Evidence: NOD32 machine uninstall entry reported as 'ESET Security'
     # (checked in Tactical terminal, 28 Sep 2026); NOD32 has no ermm.exe.
-    [string[]]$HomeProductNames = @('ESET Security')
+    [string[]]$HomeProductNames = @('ESET Security'),
+
+    # By default ESET error 3 on 'get protection-status' is treated as HEALTHY (see the
+    # protection status section for the evidence). Add -StrictProtectionStatus to go back
+    # to reporting it as "RMM not answering" (Info, exit 3).
+    [switch]$StrictProtectionStatus
 )
 
 # ---------------------------------------------------------------------------
@@ -364,7 +369,37 @@ if ($appInfo) {
 # access blocked" turns the product status red, per the isolation doc),
 # not activated, expired licence, disabled modules, and anything new ESET adds.
 # ---------------------------------------------------------------------------
-$prot = Invoke-Ermm @('get', 'protection-status')
+# ERROR 3 = HEALTHY (provisional, Ethan's decision 2026-10-25, to be tested):
+# On ESET Endpoint 13.1.2036.0, 'get protection-status' returns error 3 "General error
+# executing command." on 176 of 183 machines, while application-info, license-info,
+# activation-status and update-status all answer. Every 13.1 machine that DID answer had a
+# non-green status (LiveGrid unreachable x4, not activated x1); none answered while green.
+# So error 3 most likely means "nothing to report", like the empty-log error 3 from
+# 'get logs' below. Not yet proven (needs a deliberately non-green 13.1 test).
+# Licence, activation and detection checks below still run, so those problems are still caught.
+$prot = $null
+$protError3 = $false
+$protText = Invoke-ErmmProcess @('get', 'protection-status')
+if ($protText) {
+    try {
+        $protJson = $protText | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $protJson.error) {
+            $prot = $protJson.result
+        }
+        elseif ($protJson.error.id -eq 3 -and -not $StrictProtectionStatus) {
+            $protError3 = $true
+            # Empty stand-in so the checks below run unchanged (no status items to judge).
+            $prot = [pscustomobject]@{ statuses = @(); status = 'n/a'; description = 'ESET returned error 3, treated as healthy' }
+            $Info.Add("Protection status: ESET returned error 3 - treated as healthy (provisional; add -StrictProtectionStatus to report it instead).")
+        }
+        else {
+            $Warning.Add("ermm get protection-status returned error: $($protJson.error | ConvertTo-Json -Compress)")
+        }
+    }
+    catch {
+        $Warning.Add("ermm get protection-status failed or gave non-JSON output: $protText")
+    }
+}
 
 if ($null -eq $prot) {
     # If we cannot even read protection status, the monitor is blind.
@@ -452,7 +487,10 @@ if ($act) {
             $_.id -match 'Activat' -or $_.description -match 'not activated'
         }
 
-        if ($activationIssueNow) {
+        if ($protError3) {
+            $Warning.Add("Last ESET activation attempt failed and current activation state can't be confirmed (protection status returned error 3): $actText")
+        }
+        elseif ($activationIssueNow) {
             $Critical.Add("Last ESET activation attempt FAILED and product is still not activated: $actText")
         }
         else {

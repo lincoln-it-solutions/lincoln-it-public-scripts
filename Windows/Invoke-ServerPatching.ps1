@@ -26,9 +26,10 @@
         Ethan's order 2026-10-25: hosts, then DCs, then other servers in week 3:
             host=1;dc=2;vm=3;other=3
         A type with no entry (e.g. "other") is NOT patched; the script says so.
-      - Opt-out: TRMM checkbox custom field "Exclude From Patching" on the Client
-        or the Agent. Passed in as
+      - Opt-out: TRMM checkbox custom field "Exclude From Patching" on the Client,
+        Site or Agent. Passed in as
             WU_EXCLUDE_CLIENT={{client.Exclude From Patching}}
+            WU_EXCLUDE_SITE={{site.Exclude From Patching}}
             WU_EXCLUDE_AGENT={{agent.Exclude From Patching}}
         TRMM sends a checkbox to PowerShell as the text "$True"/"$False"
         (tacticalrmm api/tacticalrmm/tacticalrmm/utils.py format_shell_bool).
@@ -111,7 +112,7 @@ function Stop-Check([int]$Code) {
 # Opt-out custom fields. Checkbox arrives as "$True"/"$False"; a missing field
 # means the env var is not set at all, which counts as "not excluded".
 function Get-PatchingExclusion {
-    foreach ($n in 'WU_EXCLUDE_CLIENT', 'WU_EXCLUDE_AGENT') {
+    foreach ($n in 'WU_EXCLUDE_CLIENT', 'WU_EXCLUDE_SITE', 'WU_EXCLUDE_AGENT') {
         $v = [Environment]::GetEnvironmentVariable($n)
         if ("$v" -match '^\$?true$|^1$') { return $n }
     }

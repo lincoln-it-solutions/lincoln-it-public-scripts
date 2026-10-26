@@ -62,11 +62,12 @@ $WuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $AuKey = "$WuKey\AU"
 
 try {
-    # Opt-out: TRMM checkbox custom field "Exclude From Patching" on the Client or
-    # Agent, passed as env vars WU_EXCLUDE_CLIENT / WU_EXCLUDE_AGENT. TRMM sends a
+    # Opt-out: TRMM checkbox custom field "Exclude From Patching" on the Client, Site
+    # or Agent (site level added 2026-10-25), passed as env vars WU_EXCLUDE_CLIENT /
+    # WU_EXCLUDE_SITE / WU_EXCLUDE_AGENT. TRMM sends a
     # checkbox to PowerShell as the text "$True"/"$False" (tacticalrmm utils.py
     # format_shell_bool); a missing field means the env var is absent = not excluded.
-    foreach ($exclVar in 'WU_EXCLUDE_CLIENT', 'WU_EXCLUDE_AGENT') {
+    foreach ($exclVar in 'WU_EXCLUDE_CLIENT', 'WU_EXCLUDE_SITE', 'WU_EXCLUDE_AGENT') {
         if ("$([Environment]::GetEnvironmentVariable($exclVar))" -match '^\$?true$|^1$') {
             Write-Output "EXCLUDED from patching ($exclVar is ticked). Nothing checked or changed."
             Stop-Check 0
