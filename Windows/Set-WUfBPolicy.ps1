@@ -187,6 +187,7 @@ try {
         @{ Key = $AuKey; Name = 'ScheduledInstallDay';             Type = 'DWord';  Value = 0 }
         @{ Key = $AuKey; Name = 'ScheduledInstallTime';            Type = 'DWord';  Value = $ScheduledInstallHour }
         @{ Key = $AuKey; Name = 'NoAutoRebootWithLoggedOnUsers';   Type = 'DWord';  Value = 1 }
+        @{ Key = $AuKey; Name = 'UpdateNotificationLevel';   Type = 'DWord';  Value = 2 }
     )
     if ($ExcludeDrivers) {
         $wanted += @{ Key = $WuKey; Name = 'ExcludeWUDriversInQualityUpdate'; Type = 'DWord'; Value = 1 }
