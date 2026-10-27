@@ -38,8 +38,8 @@
 
     WHAT IT DOES NOT DO
       - It does not set any restart deadline (Ethan's choice 2026-10-25: reboot nag only).
-      - It does not delete any other policy values unless -CleanLeftovers is passed.
-        Anything else it finds under the WindowsUpdate keys is listed in the output.
+      - It does not delete any other policy values. Anything else it finds under
+        the WindowsUpdate keys is listed in the output so you can see it.
       - It does nothing on Windows Server (scope chosen 2026-10-25: workstations only).
       - It does not overwrite settings on a device that has Intune (MDM) Update
         policies applied, unless -Force is passed, because MDM policy and these
@@ -55,19 +55,6 @@
       1 = report only: differences found, nothing changed
       2 = error (not admin, write failed, read-back mismatch)
       3 = skipped: Intune Update policy present and -Force not passed (Info)
-
-.PARAMETER CleanLeftovers
-    Opt-in cleanup of old settings that conflict with this policy (Ethan 2026-10-27), only written
-    with -Apply (report-only lists them):
-      1. Intune leftovers: every value under HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update
-         is removed instead of the script skipping with exit 3. If an Intune update policy is still
-         assigned, Intune writes them back at its next sync and this removes them again each run
-         (the output says how many were removed, so a loop is visible).
-      2. Stray values under WindowsUpdate and WindowsUpdate\AU that this script does not manage
-         (e.g. DeferFeatureUpdates, PauseFeatureUpdatesStartTime, AU\ScheduledInstallEveryWeek).
-         NEVER removed: WSUS / update-source values (WUServer, WUStatusServer, UseWUServer,
-         TargetGroup*, SetPolicyDrivenUpdateSourceFor*, DoNotConnectToWindowsUpdateInternetLocations,
-         DisableWindowsUpdateAccess, ElevateNonAdmins) and ExcludeWUDriversInQualityUpdate.
 
 .PARAMETER Apply
     Write the settings. Without it the script only reports.
@@ -126,8 +113,7 @@ param(
     [ValidatePattern('^\d{2}H\d$')][string]$Windows10Version = '22H2',
     [ValidateRange(0, 23)][int]$ScheduledInstallHour = 12,
     [switch]$ExcludeDrivers,
-    [switch]$Force,
-    [switch]$CleanLeftovers
+    [switch]$Force
 )
 
 # Stop on unexpected errors so nothing fails silently.
@@ -186,24 +172,9 @@ try {
     if (Test-Path $mdmKey) {
         $mdmValues = @((Get-Item $mdmKey).Property | Where-Object { $_ -notlike '*_ProviderSet' -and $_ -notlike '*_WinningProvider' })
     }
-    if ($mdmValues.Count -gt 0 -and -not $Force -and -not $CleanLeftovers) {
+    if ($mdmValues.Count -gt 0 -and -not $Force) {
         Write-Output "SKIPPED: Intune Update policies are applied on this device ($($mdmValues -join ', ')). Pass -Force to apply anyway."
         Stop-Check 3
-    }
-
-    # 4b. -CleanLeftovers: remove the Intune values rather than skipping (see .PARAMETER).
-    $pendingMdm = $false
-    if ($CleanLeftovers -and $mdmValues.Count -gt 0) {
-        $mdmAll = @((Get-Item $mdmKey).Property)
-        if ($Apply) {
-            foreach ($n in $mdmAll) { Remove-ItemProperty -Path $mdmKey -Name $n -Force }
-            $mdmLeft = @((Get-Item $mdmKey).Property)
-            if ($mdmLeft.Count -gt 0) { Write-Output "ERROR: could not remove $($mdmLeft.Count) Intune update value(s)."; Stop-Check 2 }
-            Write-Output "Removed $($mdmAll.Count) leftover Intune update value(s) from PolicyManager (Update key now empty)."
-        } else {
-            $pendingMdm = $true
-            Write-Output "  Leftover Intune update values (would be removed with -Apply): $($mdmAll.Count)"
-        }
     }
 
     # 5. The wanted values: key, name, type, value. One list drives both the
@@ -219,12 +190,6 @@ try {
         @{ Key = $AuKey; Name = 'ScheduledInstallDay';             Type = 'DWord';  Value = 0 }
         @{ Key = $AuKey; Name = 'ScheduledInstallTime';            Type = 'DWord';  Value = $ScheduledInstallHour }
         @{ Key = $AuKey; Name = 'NoAutoRebootWithLoggedOnUsers';   Type = 'DWord';  Value = 1 }
-        # Update notifications off (Ethan 2026-10-26: restarts are handled by the reboot nag).
-        # UpdateNotificationLevel lives in WindowsUpdate, NOT WindowsUpdate\AU (Kapil Arya's guide and
-        # a Microsoft Q&A answer both give that key). 2 = all notifications off incl. restart warnings.
-        # SetUpdateNotificationLevel = 1 is the 'policy enabled' flag the Group Policy setting
-        # "Display options for update notifications" writes - from Claude's own knowledge, NOT
-        # confirmed from a Microsoft page; check on a test VM that the notifications stop.
         @{ Key = $WuKey; Name = 'SetUpdateNotificationLevel';      Type = 'DWord';  Value = 1 }
         @{ Key = $WuKey; Name = 'UpdateNotificationLevel';         Type = 'DWord';  Value = 2 }
     )
@@ -255,23 +220,10 @@ try {
     # 6. Report anything else under the keys, so unknown policy (GPO, old tools,
     #    restart deadlines) is visible. Nothing here is changed.
     $managed = $wanted | ForEach-Object { $_.Name }
-    # Never removed by -CleanLeftovers: update-source (WSUS) settings and the driver-exclusion choice.
-    $protected = 'WUServer','WUStatusServer','UseWUServer','TargetGroup','TargetGroupEnabled','ElevateNonAdmins',
-                 'DisableWindowsUpdateAccess','DoNotConnectToWindowsUpdateInternetLocations','ExcludeWUDriversInQualityUpdate'
-    $leftovers = @()
     foreach ($k in $WuKey, $AuKey) {
         if (Test-Path $k) {
             $others = (Get-Item $k).Property | Where-Object { $managed -notcontains $_ }
-            foreach ($o in $others) {
-                $shown = "$($k.Replace('HKLM:\SOFTWARE\Policies\Microsoft\Windows\',''))\$o = $(Get-PolicyValue $k $o)"
-                $isProtected = ($protected -contains $o) -or ($o -like 'SetPolicyDrivenUpdateSourceFor*')
-                if ($CleanLeftovers -and -not $isProtected) {
-                    $leftovers += [pscustomobject]@{ Key = $k; Name = $o }
-                    Write-Output "  Leftover to remove: $shown"
-                } else {
-                    Write-Output "  Other value (left alone): $shown"
-                }
-            }
+            foreach ($o in $others) { Write-Output "  Other value (left alone): $($k.Replace('HKLM:\SOFTWARE\Policies\Microsoft\Windows\',''))\$o = $(Get-PolicyValue $k $o)" }
         }
     }
 
@@ -280,7 +232,7 @@ try {
     # mistake. It is removed with -Apply so the device only has the copy in the right key.
     $stray = $null -ne (Get-PolicyValue $AuKey 'UpdateNotificationLevel')
     if ($stray) { Write-Output '  Stray value to remove: WindowsUpdate\AU\UpdateNotificationLevel (wrong key, from an earlier version)' }
-    if ($diffs.Count -eq 0 -and -not $stray -and $leftovers.Count -eq 0 -and -not $pendingMdm) { Write-Output 'OK: device already matches the wanted settings.'; Stop-Check 0 }
+    if ($diffs.Count -eq 0 -and -not $stray) { Write-Output 'OK: device already matches the wanted settings.'; Stop-Check 0 }
 
     Write-Output "Differences ($($diffs.Count)):"
     $diffs | ForEach-Object { Write-Output ("  {0}: {1} -> {2}" -f $_.Setting, $_.Current, $_.Wanted) }
@@ -298,13 +250,6 @@ try {
         Remove-ItemProperty -Path $AuKey -Name 'UpdateNotificationLevel' -Force
         if ($null -ne (Get-PolicyValue $AuKey 'UpdateNotificationLevel')) { Write-Output 'ERROR: could not remove stray AU\UpdateNotificationLevel.'; Stop-Check 2 }
         Write-Output 'Removed stray WindowsUpdate\AU\UpdateNotificationLevel.'
-    }
-
-    # 8b. -CleanLeftovers: remove stray values, then confirm each is gone.
-    foreach ($l in $leftovers) {
-        Remove-ItemProperty -Path $l.Key -Name $l.Name -Force
-        if ($null -ne (Get-PolicyValue $l.Key $l.Name)) { Write-Output "ERROR: could not remove $($l.Key)\$($l.Name)."; Stop-Check 2 }
-        Write-Output "Removed leftover $($l.Name) from $($l.Key.Replace('HKLM:\SOFTWARE\Policies\Microsoft\Windows\',''))."
     }
 
     # 9. Read back to prove the writes landed.
