@@ -1,0 +1,61 @@
+<#
+.SYNOPSIS
+    Read-only diagnosis for "The ESET LiveGrid servers cannot be reached".
+.DESCRIPTION
+    Built 2026-10-26 for DESKTOP-71SNJNG (Belvin): the only Belvin machine with
+    the LiveGrid warning, so the cause is on the machine, not the site firewall.
+    Run on the affected machine AND a healthy one, then compare. Changes nothing.
+      1. ESET's own warning log entries mentioning LiveGrid/cloud (what ESET says failed)
+      2. TCP reachability of ESET LiveGrid hosts/ports (ESET KB332: TCP 80, TCP/UDP 53535)
+      3. WinHTTP proxy + per-machine proxy (a stale proxy would only affect this PC)
+      4. DNS servers / adapters / VPN adapters (a different DNS or VPN would only affect this PC)
+      5. Clock offset (TLS/cloud lookups fail if the clock is badly out)
+      6. Third-party firewall/security products registered with Windows
+#>
+$ErrorActionPreference = 'SilentlyContinue'
+"== $env:COMPUTERNAME  $(Get-Date -Format s)"
+
+# 1. ESET warning log entries about LiveGrid/cloud (ermm 'get logs --name warnlog').
+$ermm = "$env:ProgramFiles\ESET\ESET Security\ermm.exe"
+if (Test-Path $ermm) {
+    $j = & $ermm get logs --name warnlog | Out-String | ConvertFrom-Json
+    $hits = @($j.result.warnlog.logs | Where-Object { ($_ | ConvertTo-Json -Compress) -match 'LiveGrid|cloud|53535|eset\.com' })
+    "-- ESET warnlog entries mentioning LiveGrid/cloud: $($hits.Count) (showing last 8)"
+    $hits | Select-Object -Last 8 | ForEach-Object { '   ' + ($_ | ConvertTo-Json -Compress) }
+    if ($j.error) { "   warnlog error: $($j.error | ConvertTo-Json -Compress)" }
+}
+
+# 2. TCP tests (3 s timeout each) to LiveGrid hosts from ESET KB332.
+"-- TCP tests"
+foreach ($h in 'h1-c01.eset.com','h1-c02.eset.com','h1-c03.eset.com','h1-c04.eset.com','h1-c05.eset.com','h1-c06.eset.com','h1-c07.eset.com','a.c.eset.com') {
+    foreach ($p in 80, 53535) {
+        $c = New-Object Net.Sockets.TcpClient
+        $ok = $false; try { $ok = $c.ConnectAsync($h, $p).Wait(3000) -and $c.Connected } catch { }
+        $c.Close()
+        $ip = try { ([Net.Dns]::GetHostAddresses($h) | Select-Object -First 1).IPAddressToString } catch { 'DNS-FAIL' }
+        "   $h ($ip):$p $(if ($ok) {'open'} else {'BLOCKED'})"
+    }
+}
+
+# 3. Proxy settings.
+"-- WinHTTP proxy"; netsh winhttp show proxy | Where-Object { $_ -match '\S' } | ForEach-Object { '   ' + $_.Trim() }
+$ie = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings'
+"   machine policy ProxySettingsPerUser=$($ie.ProxySettingsPerUser)"
+
+# 4. Network adapters, DNS servers, VPN-looking adapters.
+"-- Adapters (up)"
+Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object {
+    $dns = (Get-DnsClientServerAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4).ServerAddresses -join ','
+    "   $($_.Name) | $($_.InterfaceDescription) | DNS $dns"
+}
+
+# 5. Clock offset vs an NTP-style check (w32tm stripchart, one sample).
+"-- Time"; w32tm /query /status | Select-String 'Source|Last Successful' | ForEach-Object { '   ' + $_.ToString().Trim() }
+
+# 6. Security products registered with Windows Security Center (workstations only).
+"-- Registered AV/firewall products"
+Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | ForEach-Object { "   AV: $($_.displayName)" }
+Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct  | ForEach-Object { "   FW: $($_.displayName)" }
+
+# 7. Uptime (a long uptime can leave ESET's cloud module stuck until restart).
+"-- Last boot: $((Get-CimInstance Win32_OperatingSystem).LastBootUpTime)"
