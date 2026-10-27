@@ -15,8 +15,8 @@
     Compares them with what the machine reports via ESET's own RMM tool:
         ermm.exe get license-info   -> type, public_id, seat_name, expiration_state
         https://help.eset.com/ees/13/en-US/rmm_json_commands_license.html
-    ("type":"MSP" and a top-level "public_id" confirmed live on Belvin and
-    Bifrangi MSP seats, 2026-10-25.)
+    ("type":"MSP" and a top-level "public_id" confirmed live on MSP seats at two
+    clients, 2026-10-25.)
 
     What happens when the machine is NOT on the expected licence:
       MSP      ESET's MSP portal does not show full activation keys, so TRMM
@@ -93,10 +93,10 @@ function Hide-Key([string]$Key) {
 # PROTECT portal, not by TRMM (Ethan, 2026-10-26: MSP only).
 $KeyOptionalTypes = @('MSP')
 
-# What ermm reports as "type" for each dropdown option. MSP confirmed live.
-# NFR is ESET's own docs example. EBA has NOT been seen yet, so for EBA only
-# the public ID is compared (the type is reported but not judged).
-$ExpectedErmmType = @{ 'MSP' = 'MSP'; 'NFR' = 'NFR'; 'EBA' = $null }
+# What ermm reports as "type" for each dropdown option, all confirmed live:
+# MSP -> "MSP", NFR -> "NFR" (Steve-Win11), EBA -> "PAID" (full census
+# 2026-10-26: every EBA machine at 13 clients reported "PAID").
+$ExpectedErmmType = @{ 'MSP' = 'MSP'; 'NFR' = 'NFR'; 'EBA' = 'PAID' }
 
 # ---------------------------------------------------------------------------
 # 1. Is ESET installed and managed by us? Same rules as Monitor-ESET.ps1 so
@@ -118,7 +118,7 @@ if ($ErmmPath) {
 }
 
 if (-not $SkipInstallChecks) {
-    # Read each uninstall entry on its own. WHY: on BIFRANGI22-PC (2026-10-26)
+    # Read each uninstall entry on its own. WHY: on one client PC (2026-10-26)
     # one malformed entry made a single wildcard Get-ItemProperty call throw
     # "Specified cast is not valid" and return NOTHING, so the ESET Management
     # Agent wasn't seen and the machine was wrongly skipped as "unmanaged".
@@ -165,6 +165,13 @@ $LicRaw  = ("$env:ESET_LICENCE").Trim()
 if ($LicType -match '^\{\{') { $LicType = '' }
 if ($LicRaw  -match '^\{\{') { $LicRaw  = '' }
 
+# The 'ESET Licence' field's default is an EXAMPLE showing the format
+# (XXX-XXX-XXX | XXXX-XXXX-XXXX-XXXX-XXXX). TRMM passes a field's default to
+# scripts when the client has no value (tacticalrmm/utils.py get_db_value), so
+# the example means "not filled in" - never a real licence.
+$ExampleLicence = $false
+if ($LicRaw.Split('|')[0].Trim().ToUpper() -eq 'XXX-XXX-XXX') { $LicRaw = ''; $ExampleLicence = $true }
+
 if (-not $LicType) {
     Write-Output "WARNING: client field 'ESET Licence Type' is not set for this client - can't check the ESET licence on $env:COMPUTERNAME."
     Write-Output "Set it in TRMM (Clients > Edit) to MSP, EBA or NFR."
@@ -175,7 +182,9 @@ if (@('MSP', 'EBA', 'NFR') -notcontains $LicType) {
     Stop-Check 1
 }
 if (-not $LicRaw) {
-    Write-Output "WARNING: client field 'ESET Licence' is empty for this $LicType client - can't check the ESET licence on $env:COMPUTERNAME."
+    $why = if ($ExampleLicence) { "still holds the example value, not a real licence" } else { "is empty" }
+    Write-Output "WARNING: client field 'ESET Licence' $why for this $LicType client - can't check the ESET licence on $env:COMPUTERNAME."
+    Write-Output "Fill it in TRMM (Clients > Edit) as '<public ID> | <activation key>' - MSP clients can give just the public ID."
     Stop-Check 1
 }
 
@@ -279,7 +288,6 @@ if (-not $m.ok) {
 $expected = "$LicType licence $WantId"
 if (Test-Match $m) {
     Write-Output "OK: $env:COMPUTERNAME is on the expected $expected - $(Describe $m)."
-    if ($LicType -eq 'EBA') { Write-Output "  [INFO] EBA licence type reported by ermm: '$($m.type)' (only the public ID is compared for EBA)." }
     Stop-Check 0
 }
 

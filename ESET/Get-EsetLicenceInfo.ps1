@@ -21,6 +21,17 @@
     JSON so the Python side can parse it, and always exits 0 (a census run
     should never raise TRMM alerts).
 
+    AUDIT FIELDS (added 2026-10-26), included in every result line:
+      mgmt_agent           ESET Management Agent name + version, "" if none
+                           (no agent = "unmanaged" in Monitor-ESET / the licence check)
+      eset_product         first other ESET uninstall entry (name + version)
+      single_lookup_failed true when ONE wildcard Get-ItemProperty over the
+                           Uninstall keys throws (seen on one client PC: "Specified
+                           cast is not valid"). Monitor-ESET.ps1 uses that single
+                           call, so on these machines it can't see the agent and
+                           treats ESET as unmanaged - i.e. silently unmonitored.
+      single_lookup_count  how many ESET entries that single call returned
+
 .NOTES
     Add to TRMM as a PowerShell script, e.g. named "ESET - Get Licence Info".
     No arguments.
@@ -34,6 +45,8 @@ $ErrorActionPreference = 'Stop'
 function Write-Result {
     param([hashtable]$Data)
     $Data['hostname'] = $env:COMPUTERNAME
+    # Add the audit fields (worked out once, below) to every result.
+    if ($script:Audit) { foreach ($k in $script:Audit.Keys) { $Data[$k] = $script:Audit[$k] } }
     Write-Output ($Data | ConvertTo-Json -Compress -Depth 10)
     exit 0
 }
@@ -60,6 +73,47 @@ function Find-JsonValue {
         }
     }
     return $null
+}
+
+# 0. Audit: what the Windows uninstall entries say about ESET.
+#    a) Per-key read (one bad entry only loses itself) - the reliable answer.
+$UninstallRoots = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+$EsetEntries = @(
+    foreach ($root in $UninstallRoots) {
+        foreach ($key in (Get-ChildItem -Path $root -ErrorAction SilentlyContinue)) {
+            try {
+                $p = Get-ItemProperty -Path $key.PSPath -ErrorAction Stop
+                if ($p.DisplayName -match 'ESET' -or $p.Publisher -match 'ESET') { $p }
+            } catch { }
+        }
+    }
+)
+$agent = $EsetEntries | Where-Object { $_.DisplayName -match '^ESET (Management|Remote Administrator) Agent' } | Select-Object -First 1
+$prod  = $EsetEntries | Where-Object { $_.DisplayName -notmatch '^ESET (Management|Remote Administrator) Agent' } | Select-Object -First 1
+
+#    b) The single wildcard call Monitor-ESET.ps1 uses - does it break here?
+$singleFailed = $false
+$singleCount = 0
+try {
+    $single = @(Get-ItemProperty @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        ) -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'ESET' -or $_.Publisher -match 'ESET' })
+    $singleCount = $single.Count
+} catch {
+    $singleFailed = $true
+}
+# Also count it as failed when it silently found fewer ESET entries than the per-key read.
+if ($singleCount -lt $EsetEntries.Count) { $singleFailed = $true }
+
+$script:Audit = @{
+    mgmt_agent           = $(if ($agent) { "$($agent.DisplayName) $($agent.DisplayVersion)".Trim() } else { '' })
+    eset_product         = $(if ($prod)  { "$($prod.DisplayName) $($prod.DisplayVersion)".Trim() } else { '' })
+    single_lookup_failed = $singleFailed
+    single_lookup_count  = $singleCount
 }
 
 # 1. Find ermm.exe. We search the ESET folders rather than hard-coding one

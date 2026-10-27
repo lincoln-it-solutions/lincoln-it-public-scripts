@@ -130,8 +130,23 @@ try {
     $lastCU = $installs |
         Where-Object { $_.ResultCode -in 2, 3 -and ($_.Title -match '^\d{4}-\d{2} Security Update \(KB\d+\) \(\d+\.\d+\)' -or $_.Title -match 'Cumulative Update for Windows') -and $_.Title -notmatch 'Preview|\.NET' } |
         Sort-Object Date -Descending | Select-Object -First 1
+    # FALLBACK: Windows Update history can be empty of cumulative updates (seen on WWS-LT01 on
+    # 2026-10-26: history held only 6 Defender/hardware entries, yet Get-HotFix listed the Oct
+    # security updates and the build was current). So when history has none, use the newest
+    # "Security Update" in Win32_QuickFixEngineering instead of raising a false CRITICAL.
+    # LIMIT: that list can also contain .NET security updates, and InstalledOn is date-only.
+    $hotfix = $null
     if (-not $lastCU) {
-        $Critical.Add('No successful cumulative update found in Windows Update history.')
+        $hotfix = Get-HotFix -ErrorAction SilentlyContinue |
+            Where-Object { $_.Description -eq 'Security Update' -and $_.InstalledOn } |
+            Sort-Object InstalledOn -Descending | Select-Object -First 1
+    }
+    if ($hotfix) {
+        $age = [int]((Get-Date) - $hotfix.InstalledOn).TotalDays
+        $Info.Add("Last security update (from installed hotfixes, Windows Update history had none): $($hotfix.HotFixID) on $($hotfix.InstalledOn.ToString('yyyy-MM-dd')) ($age days ago)")
+        if ($age -gt $MaxDaysSinceCU) { $Critical.Add("Last security update is $age days old (limit $MaxDaysSinceCU).") }
+    } elseif (-not $lastCU) {
+        $Critical.Add('No successful cumulative update found in Windows Update history or installed hotfixes.')
     } else {
         # History dates are UTC; compare in UTC.
         $age = [int]((Get-Date).ToUniversalTime() - $lastCU.Date).TotalDays
