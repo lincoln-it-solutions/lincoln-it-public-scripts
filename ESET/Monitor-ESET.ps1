@@ -156,6 +156,13 @@ param(
     [int]$RestartAlertAfterHours = 24,
     [int]$PostRestartGraceMinutes = 30,
 
+    # LiveGrid unreachable (Ethan 2026-11-05: "if the livegrid isnt reached for 7 days then it errors").
+    # ESET reports "LiveGrid servers cannot be reached" for short outages (sleep, roaming, VPN) that fix
+    # themselves, so it is NOT alerted straight away. The first run that sees it records the time in
+    # $StateDir\livegrid-first-seen.json; it becomes a CRITICAL finding only once it has been seen
+    # on every run for this many days. Any run that does not see it resets the clock.
+    [int]$LiveGridAlertAfterDays = 7,
+
     # TEST HOOKS ONLY (offline testing with a fake ermm). Leave unset in TRMM.
     [long]$TestBootEpoch = 0,
     [int]$TestProductType = 0,
@@ -607,6 +614,14 @@ if ($null -eq $prot) {
     # policy arrives (seen 2026-10-27: a few minutes), so show the installer's state here too.
     if ($InstallStatus -and $InstallStatus.viaBackup -eq $true -and $null -ne $InstallAgeMin -and $InstallAgeMin -lt 180) { Write-Output "  $(Get-InstallStatusText)" }
     $Warning | ForEach-Object { Write-Output "  $_" }
+    # MUTE FIX (Ethan, 2026-10-28, DCC PC L10220420: "this is alerting on eset but i thought we excluded eba").
+    # Checks 416/417 have info_return_codes [3], so TRMM raises an INFO-severity alert for exit 3. This
+    # branch ran before any mute was applied, so a muted (EBA) client still alerted. A muted client now
+    # exits 0 here; the output above stays in the check history.
+    if ($MuteThisClient) {
+        Write-Output "OK (muted): the RMM-not-answering finding above is not alerted - alerting is muted for $ClientLicType clients."
+        Stop-Check 0
+    }
     Stop-Check 3
 }
 
@@ -806,10 +821,19 @@ else {
     }
 }
 
-# What ermm reports as 'type' for each client licence type (all seen live).
-$ExpectedErmmType = @{ 'MSP' = 'MSP'; 'EBA' = 'PAID'; 'NFR' = 'NFR' }
+# What ermm reports as 'type' for each client licence type (all seen live). Each is a LIST
+# of accepted types. MSP also accepts TRIAL: a trial MSP licence (e.g. a new client's trial
+# ordered in EMA 2 - 3BD-DDK-8SB was confirmed trial=True by EMA 2 on 2026-11-03) reports
+# ermm type TRIAL, which is a correct match for the client's MSP licence, not a problem.
+# An expired trial is still caught by the separate expiry checks above.
+$ExpectedErmmType = @{ 'MSP' = @('MSP','TRIAL'); 'EBA' = @('PAID'); 'NFR' = @('NFR') }
 $HaveId   = if ($lic) { ("$($lic.public_id)").Trim().ToUpper() } else { '' }
 $HaveType = if ($lic) { ("$($lic.type)").Trim().ToUpper() } else { '' }
+# Fixed-format line for the bridge's ESET licence sync (eset_licence_sync.py), which reads
+# this check's latest output from TRMM to learn which devices sit on which ESET licence
+# (the ESET MSP API has no per-device listing). Do not reword: the sync matches on
+# "ESET-LICENCE-ID: <id> type=<type>". Info only - it changes no result or exit code.
+if ($HaveId) { $Info.Add("ESET-LICENCE-ID: $HaveId type=$HaveType") }
 # Not activated = protection status says so, or license-info has no public ID.
 $NotActivated = [bool]$NotActivatedStatus -or ($lic -and -not $HaveId)
 $ActivationHandled = $false   # tells section 4 not to raise a second alert
@@ -818,7 +842,7 @@ function Test-LicenceMatch($id, $type) {
     if (-not $WantId) { return $false }
     if ($id -ne $WantId) { return $false }
     $exp = $ExpectedErmmType[$LicType]
-    return (-not $exp -or $type -eq $exp)
+    return (-not $exp -or $exp -contains $type)
 }
 
 if ($FieldProblem) {
@@ -832,12 +856,12 @@ if ($FieldProblem) {
     }
 }
 elseif ($lic -and -not $NotActivated -and (Test-LicenceMatch $HaveId $HaveType)) {
-    $Info.Add("Licence matches the client: $LicType $WantId (ermm type $HaveType).")
+    $Info.Add("Licence matches the client: $LicType $WantId (ermm type $HaveType)$(if ($HaveType -eq 'TRIAL') { ' - a trial licence; expiry is checked separately' }).")
 }
 elseif ($lic -or $NotActivated) {
     $ActivationHandled = $true
     $state = if ($NotActivated) { 'NOT ACTIVATED' }
-             elseif ($HaveId -eq $WantId) { "on licence $WantId but as type $HaveType - client field says $LicType (expected ermm type $($ExpectedErmmType[$LicType]))" }
+             elseif ($HaveId -eq $WantId) { "on licence $WantId but as type $HaveType - client field says $LicType (expected ermm type $($ExpectedErmmType[$LicType] -join ' or '))" }
              else { "on licence $HaveId (type $HaveType), not the client's $LicType licence $WantId" }
     $msg = "ESET is $state."
     $isCrit = [bool]$NotActivated
@@ -927,6 +951,14 @@ if ($act) {
         if ($ActivationHandled) {
             # Section 6 already raised (or fixed) the activation problem once.
             $Info.Add("Last ESET activation attempt failed (already covered by the licence finding): $actText")
+        }
+        elseif ($lic -and $HaveId -and -not $NotActivated) {
+            # FALSE POSITIVE FIX (Ethan, 2026-10-27 23:56, 3D-SIM-PC): 'activation-status' is only the LAST
+            # attempt, and protection-status can answer error 3 on healthy machines (see section 3), so the
+            # branch below could not confirm anything and warned - while license-info (section 6, the CURRENT
+            # state) already showed a licence with a public ID and matched the client. A licence with a public
+            # ID means the product IS activated now, so the old failure is only a record.
+            $Info.Add("Earlier ESET activation attempt reported failure, but the product is activated now (licence $HaveId, type $HaveType from license-info) - not alerted: $actText")
         }
         elseif ($protError3) {
             $Warning.Add("Last ESET activation attempt failed and current activation state can't be confirmed (protection status returned error 3): $actText")
@@ -1158,6 +1190,7 @@ function Test-Tcp([string]$HostName, [int]$Port) {
     catch { return $false }
     finally { $c.Close() }
 }
+$LiveGridFile = Join-Path $StateDir 'livegrid-first-seen.json'
 if ($LiveGridLine) {
     $tests = @()
     foreach ($h in @('h1-c01.eset.com', 'a.c.eset.com')) {
@@ -1170,7 +1203,45 @@ if ($LiveGridLine) {
     }
     $hint = if ($tests -match 'FAILED|BLOCKED') { "Allow outbound to ESET LiveGrid (KB332: TCP 80, TCP/UDP 53535) on the firewall/proxy." }
             else { "TCP tests passed - may be UDP 53535 or an intermittent outage; recheck next run." }
-    Update-Finding $LiveGridLine "$LiveGridLine - not fixable from TRMM (network). Tests: $($tests -join '; '). $hint"
+    $lgText = "$LiveGridLine - not fixable from TRMM (network). Tests: $($tests -join '; '). $hint"
+
+    # How long has it been unreachable? First-seen time is kept in our own state file.
+    # ESET lists the same status several times on some PCs, so ALL copies are removed from the
+    # lists first and one finding (or Info line) is added back below.
+    while ($Warning.Remove($LiveGridLine)) { }
+    while ($Critical.Remove($LiveGridLine)) { }
+    $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $lgFirst = $null
+    if (Test-Path $LiveGridFile) {
+        try { $lgFirst = [long](Get-Content $LiveGridFile -Raw | ConvertFrom-Json).FirstSeenEpoch } catch { $lgFirst = $null }
+        # A time in the future or before 2020 is not ours / is damaged: start the clock again.
+        if ($lgFirst -and ($lgFirst -gt $nowEpoch -or $lgFirst -lt 1577836800)) { $lgFirst = $null }
+    }
+    if (-not $lgFirst -and $Fix) {
+        # Writing the clock start is done only with -Fix (it writes a file on the PC, like the other state).
+        try {
+            if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+            [System.IO.File]::WriteAllText($LiveGridFile, (@{ FirstSeenEpoch = $nowEpoch } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+            $lgFirst = $nowEpoch
+        } catch { $lgFirst = $null }
+    }
+    if (-not $lgFirst) {
+        # Cannot time it (run without -Fix, or the state file could not be written): report it as before
+        # rather than hide it.
+        $Warning.Add("$lgText (the time it has been unreachable is not tracked on this run: needs -Fix and a writable $StateDir)")
+    } else {
+        $lgDays = ($nowEpoch - $lgFirst) / 86400
+        $lgSince = [DateTimeOffset]::FromUnixTimeSeconds($lgFirst).UtcDateTime.ToString('yyyy-MM-dd HH:mm') + ' UTC'
+        if ($lgDays -ge $LiveGridAlertAfterDays) {
+            $Critical.Add("ESET LiveGrid has been unreachable for $([math]::Floor($lgDays)) days (since $lgSince; alert after $LiveGridAlertAfterDays days): $lgText")
+        } else {
+            $Info.Add("ESET LiveGrid not reachable since $lgSince ($([math]::Round($lgDays, 1)) of $LiveGridAlertAfterDays days) - not alerted yet. $lgText")
+        }
+    }
+}
+elseif ($prot -and (Test-Path $LiveGridFile)) {
+    # Protection status was read and LiveGrid is not reported as unreachable: the clock resets.
+    Remove-Item $LiveGridFile -Force -ErrorAction SilentlyContinue
 }
 
 # c) Push Notification Service unreachable -> network/proxy; ESET's KB8207 gives
@@ -1205,6 +1276,17 @@ $reqEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $handoffOld = $null
 if ($handoff -and ([long]$handoff.Epoch) -gt $bootEpoch) { $reqEpoch = [long]$handoff.Epoch }
 elseif ($handoff) { $handoffOld = $handoff; $handoff = $null }
+# d0) The backup installer finished with msiexec 3010 (restart needed, Ethan 2026-11-03: "restart needed ->
+#     trigger the custom ESET nag"). ESET's own protection-status often cannot say so (it returns error 3),
+#     so the installer's status file is a second source for the SAME restart line, which then follows the
+#     exact path below (nag request with ESET wording, one postpone, 24 h alert, "restarted but still
+#     asked" fault guard). It counts only if the install was recorded AFTER the last boot: once the PC has
+#     restarted the flag is stale and ignored, so it cannot loop.
+if (-not $RestartLine -and $InstallStatus -and $InstallStatus.state -eq 'installed' -and $InstallStatus.restartNeeded -eq $true -and
+    $InstallStatus.updatedEpoch -and $bootEpoch -and ([long]$InstallStatus.updatedEpoch) -gt $bootEpoch) {
+    $RestartLine = "ESET restart needed: the ESET install finished (msiexec exit 3010) and the PC has not restarted since"
+    $Warning.Add($RestartLine)   # Update-Finding/Clear-Finding below work on findings held in these lists
+}
 if ($RestartLine) {
     $pt = $TestProductType
     if (-not $pt) { try { $pt = [int](Get-CimInstance Win32_OperatingSystem).ProductType } catch { $pt = 0 } }

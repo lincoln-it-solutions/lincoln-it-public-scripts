@@ -130,20 +130,19 @@ try {
     $lastCU = $installs |
         Where-Object { $_.ResultCode -in 2, 3 -and ($_.Title -match '^\d{4}-\d{2} Security Update \(KB\d+\) \(\d+\.\d+\)' -or $_.Title -match 'Cumulative Update for Windows') -and $_.Title -notmatch 'Preview|\.NET' } |
         Sort-Object Date -Descending | Select-Object -First 1
-    # FALLBACK: Windows Update history can be empty of cumulative updates (seen on CLIENT-LT01 on
-    # 2026-10-26: history held only 6 Defender/hardware entries, yet Get-HotFix listed the Oct
-    # security updates and the build was current). So when history has none, use the newest
-    # "Security Update" in Win32_QuickFixEngineering instead of raising a false CRITICAL.
-    # LIMIT: that list can also contain .NET security updates, and InstalledOn is date-only.
-    $hotfix = $null
-    if (-not $lastCU) {
-        $hotfix = Get-HotFix -ErrorAction SilentlyContinue |
-            Where-Object { $_.Description -eq 'Security Update' -and $_.InstalledOn } |
-            Sort-Object InstalledOn -Descending | Select-Object -First 1
-    }
-    if ($hotfix) {
+    # History alone can be wrong: it can be empty, or stop at an older update after a feature update
+    # (CLIENT-LT01 on 2026-10-26: no cumulative update in history; CLIENT-PC02 on 2026-10-28: history
+    # stopped at July although the October update was installed with 26H2). So also read the installed
+    # hotfix list (Win32_QuickFixEngineering) and use whichever is NEWER.
+    # LIMIT: that list can include .NET security updates, and InstalledOn is date-only.
+    $hotfix = Get-HotFix -ErrorAction SilentlyContinue |
+        Where-Object { $_.Description -eq 'Security Update' -and $_.InstalledOn } |
+        Sort-Object InstalledOn -Descending | Select-Object -First 1
+    $useHotfix = $hotfix -and (-not $lastCU -or $hotfix.InstalledOn.ToUniversalTime() -gt $lastCU.Date)
+    if ($useHotfix) {
         $age = [int]((Get-Date) - $hotfix.InstalledOn).TotalDays
-        $Info.Add("Last security update (from installed hotfixes, Windows Update history had none): $($hotfix.HotFixID) on $($hotfix.InstalledOn.ToString('yyyy-MM-dd')) ($age days ago)")
+        $why = if ($lastCU) { "newer than the history entry from $($lastCU.Date.ToString('yyyy-MM-dd'))" } else { 'Windows Update history had none' }
+        $Info.Add("Last security update (from installed hotfixes, $why): $($hotfix.HotFixID) on $($hotfix.InstalledOn.ToString('yyyy-MM-dd')) ($age days ago)")
         if ($age -gt $MaxDaysSinceCU) { $Critical.Add("Last security update is $age days old (limit $MaxDaysSinceCU).") }
     } elseif (-not $lastCU) {
         $Critical.Add('No successful cumulative update found in Windows Update history or installed hotfixes.')
@@ -159,8 +158,16 @@ try {
     # Defender definition updates are not OS patching, so their failures are not reported here.
     $failed = $installs | Where-Object { $_.ResultCode -in 4, 5 -and $_.Date -ge $since -and
         $_.Title -notmatch '^9[A-Z0-9]{11}-' -and $_.Title -notmatch 'Security Intelligence Update|Definition Update' }
-    foreach ($f in $failed) {
-        $Warning.Add(("Install failed {0:yyyy-MM-dd}: {1} (HRESULT 0x{2:X8})" -f $f.Date, $f.Title, $f.HResult))
+    # One line per update title. A failure is dropped when the same title succeeded (ResultCode 2/3)
+    # after it; otherwise the newest failure is shown with how many times it failed in the window.
+    foreach ($grp in ($failed | Group-Object Title)) {
+        $latest = $grp.Group | Sort-Object Date -Descending | Select-Object -First 1
+        $laterOk = $installs | Where-Object { $_.Title -eq $grp.Name -and $_.ResultCode -in 2, 3 -and $_.Date -gt $latest.Date }
+        if ($laterOk) { continue }
+        # No success in history: if the title names a KB and that KB is installed now, it is not a failure.
+        if ($latest.Title -match '\(KB(\d+)\)' -and (Get-HotFix -Id "KB$($Matches[1])" -ErrorAction SilentlyContinue)) { continue }
+        $times = if ($grp.Count -gt 1) { " x$($grp.Count)" } else { '' }
+        $Warning.Add(("Install failed {0:yyyy-MM-dd}{1}: {2} (HRESULT 0x{3:X8})" -f $latest.Date, $times, $latest.Title, $latest.HResult))
     }
 
     # --- 4. Policy drift against what Set-WUfBPolicy.ps1 (workstations) or

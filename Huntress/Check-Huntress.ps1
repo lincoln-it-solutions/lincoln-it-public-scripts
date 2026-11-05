@@ -26,9 +26,9 @@ GENERIC / PER-CLIENT BEHAVIOUR (added 2026-10-27)
       'Huntress Active' field in as the HUNTRESS_ACTIVE environment variable:
         - Active = Yes : the install/registration tests below apply (fail if not installed).
         - anything else (No / blank / not set) : nothing is expected. Passes (exit 0) when
-          Huntress is NOT present, FAILS (exit 1) when any Huntress service, registry key or
-          install folder IS present - so Huntress left on a client you have not marked Active
-          is reported rather than silently ignored.
+          no Huntress service exists, FAILS (exit 1) when a Huntress service IS installed - so
+          Huntress left running on a client you have not marked Active is reported. A leftover
+          registry key or folder with no service is not an agent and only gets a note.
       The failing result is what triggers the 'Huntress - Install (generic)' task, which itself
       does nothing unless Active = Yes.
 
@@ -61,25 +61,27 @@ if ([string]::IsNullOrWhiteSpace($active) -or $active.Trim().StartsWith('{{')) {
 $active = $active.Trim().Trim("'").Trim('"')
 
 if ($active -ne 'Yes') {
-    # Not an Active client: Huntress should NOT be here. Look for any trace of it - a service,
-    # the registration key, or the install folder - so a half-removed install is caught too.
-    $shown  = if ($active) { $active } else { 'not set' }
-    $found  = New-Object System.Collections.Generic.List[string]
+    # Not an Active client: Huntress should NOT be installed here. "Installed" means a Huntress
+    # service exists - that is a real agent. A leftover registry key or Program Files folder with
+    # no service is just debris from a removed or never-registered agent, so it must not alert
+    # (it produced false positives on machines that were not live in the Huntress portal).
+    $shown   = if ($active) { $active } else { 'not set' }
+    $service = @('HuntressAgent', 'HuntressUpdater', 'HuntressRio') | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue }
 
-    foreach ($name in 'HuntressAgent', 'HuntressUpdater', 'HuntressRio') {
-        if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $found.Add("service $name") }
+    if ($service) {
+        Write-Output "FAIL Huntress is installed (service: $($service -join ', ')) but this client's 'Huntress Active' is '$shown'. Either set the client to Yes in TRMM or remove Huntress from this machine."
+        Complete-Check 1
     }
+
+    # No service. Mention any leftovers for information only, then pass.
+    $leftover = New-Object System.Collections.Generic.List[string]
     # 64-bit registry view explicitly (same reason as the registration test further down)
     $v = if ([Environment]::Is64BitOperatingSystem) { [Microsoft.Win32.RegistryView]::Registry64 } else { [Microsoft.Win32.RegistryView]::Registry32 }
     $k = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $v).OpenSubKey('SOFTWARE\Huntress Labs')
-    if ($k) { $found.Add('registry key HKLM\SOFTWARE\Huntress Labs'); $k.Close() }
-    if (Test-Path (Join-Path $env:ProgramFiles 'Huntress')) { $found.Add("folder $env:ProgramFiles\Huntress") }
-
-    if ($found.Count -gt 0) {
-        Write-Output "FAIL Huntress is present ($($found -join '; ')) but this client's 'Huntress Active' is '$shown'. Either set the client to Yes in TRMM or remove Huntress from this machine."
-        Complete-Check 1
-    }
-    Write-Output "OK   Huntress Active is '$shown' for this client and Huntress is not installed - nothing expected."
+    if ($k) { $leftover.Add('registry key HKLM\SOFTWARE\Huntress Labs'); $k.Close() }
+    if (Test-Path (Join-Path $env:ProgramFiles 'Huntress')) { $leftover.Add("folder $env:ProgramFiles\Huntress") }
+    $note = if ($leftover.Count -gt 0) { " Leftovers only, no Huntress service (not an agent): $($leftover -join '; ')." } else { '' }
+    Write-Output "OK   Huntress Active is '$shown' for this client and no Huntress agent is installed.$note"
     Complete-Check 0
 }
 

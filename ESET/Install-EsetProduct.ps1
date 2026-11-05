@@ -46,6 +46,9 @@
         Endpoint (KB8288): .../ees/windows/v13/13.1.2036.0/ees_nt64_full.msi
         Server   (KB8400): .../efs/windows/latest/efsw_nt64_full.msi
       ESET lists no 32-bit 13.x build, so a 32-bit OS is refused. Override with -EndpointUrl / -ServerUrl.
+      ARM64 Windows (CPU architecture 12, read from Win32_Processor because PowerShell itself may run
+      emulated as AMD64) gets ESET's separate ARM64 package (KB8036: .../ees/windows/latest/ees_arm64.msi).
+      There is no ARM64 Server Security package, so an ARM64 server is refused. Override with -ArmUrl.
 
     HOW THE WORKER INSTALLS (ESET command-line installation doc, help.eset.com/ees/13/en-US/installation_command_line.html)
       msiexec /i <pkg> /qn REBOOT=ReallySuppress /l*v <log> [ADDLOCAL=<list>] [ACTIVATION_DATA=key:<key>]
@@ -81,6 +84,8 @@
     Actually start the install. Without it, report only.
 .PARAMETER EndpointUrl
     MSI for workstations. Default is ESET's published 13.1.2036.0 64-bit full MSI (KB8288).
+.PARAMETER ArmUrl
+    MSI for ARM64 Windows workstations. Default is ESET's published "latest" ARM64 package (KB8036).
 .PARAMETER ServerUrl
     MSI for Windows Server. Default is ESET's published "latest" Server Security MSI (KB8400).
 .PARAMETER AddLocal
@@ -103,6 +108,7 @@ param(
     [switch]$Apply,
     [string]$EndpointUrl = 'https://download.eset.com/com/eset/apps/business/ees/windows/v13/13.1.2036.0/ees_nt64_full.msi',
     [string]$ServerUrl   = 'https://download.eset.com/com/eset/apps/business/efs/windows/latest/efsw_nt64_full.msi',
+    [string]$ArmUrl      = 'https://download.eset.com/com/eset/apps/business/ees/windows/latest/ees_arm64.msi',
     [string]$AddLocal = '',
     [int]$MaxAttemptsPerDay = 2,
     [int]$MinHoursBetween = 4,
@@ -113,6 +119,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Progress display OFF: in Windows PowerShell 5.1 it makes Invoke-WebRequest -OutFile extremely slow
+# (measured 2026-11-03: ~55 KB/s here against 9.8 MB/s for a plain .NET request to the same file on the same PC,
+# which would turn a 346 MB download into over an hour). Nobody sees this window anyway.
+$ProgressPreference = 'SilentlyContinue'
 $TaskName   = 'LincolnIT ESET Product Install'
 $StatusFile = Join-Path $StateDir 'product-install-status.json'
 $ProductFolders = @("$env:ProgramFiles\ESET\ESET Security", "$env:ProgramFiles\ESET\ESET Server Security", "$env:ProgramFiles\ESET\ESET File Security")
@@ -243,6 +253,8 @@ function Stop-Run([int]$Code, [string]$Message) {
 $LicType = "$env:ESET_LICENCE_TYPE".Trim().ToUpper()
 $LicRaw  = "$env:ESET_LICENCE".Trim()
 # TRMM hands a ticked checkbox to PowerShell as the text "$True" (seen live 2026-10-26).
+# Names Windows Security Center uses for Microsoft's own antivirus (not a conflict). Overridden only by the test copy.
+$DefenderPattern = '^(Windows|Microsoft) Defender'
 $NotRequired = ("$env:ESET_PRODUCT_NOT_REQUIRED".Trim() -match '^\$?(true|1|yes)$')
 
 # --- 2. What is installed now? Same detection as Monitor-ESET.ps1 (each uninstall key read on its
@@ -288,11 +300,28 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     Stop-Run 1 "ATTENTION: $env:COMPUTERNAME is a 32-bit Windows. ESET lists no 32-bit 13.x installer (KB8288), so nothing was installed."
 }
 
+# --- 3b. Another antivirus already on this PC? (added 2026-11-03, before the install runs automatically) ---
+# Two security products fighting each other is a classic way to break a PC, so a machine that already has a
+# non-Microsoft antivirus registered with Windows Security Center is left alone and reported. Defender alone is
+# normal and does not count (ESET switches it off itself). Servers have no Security Center, so this never fires there.
+$otherAv = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue |
+    Where-Object { $_.displayName -and $_.displayName -notmatch $DefenderPattern -and $_.displayName -notmatch '^ESET' })
+if ($otherAv.Count -gt 0) {
+    Stop-Run 1 "ATTENTION: $env:COMPUTERNAME already has another antivirus ($(($otherAv | ForEach-Object { $_.displayName }) -join ', ')), so ESET was NOT installed (two security products conflict). Remove it first, or tick 'ESET Product Not Required' for the client if this is intended."
+}
+
 # --- 4. Choose the product and work out activation ---
 $os = Get-CimInstance -ClassName Win32_OperatingSystem
 $isServer = ($os.ProductType -ne 1)           # 1 = workstation, 2 = domain controller, 3 = server
 $productName = if ($isServer) { 'ESET Server Security' } else { 'ESET Endpoint Security' }
-$url = if ($isServer) { $ServerUrl } else { $EndpointUrl }
+# Real CPU architecture: 12 = ARM64, 9 = x64. $env:PROCESSOR_ARCHITECTURE can't be used because a
+# PowerShell running under x64 emulation on ARM64 Windows reports AMD64.
+$cpuArch = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).Architecture
+$isArm64 = ($cpuArch -eq 12)
+if ($isArm64 -and $isServer) {
+    Stop-Run 1 "ATTENTION: $env:COMPUTERNAME is an ARM64 Windows Server. ESET lists no ARM64 Server Security package, so nothing was installed."
+}
+$url = if ($isServer) { $ServerUrl } elseif ($isArm64) { $ArmUrl } else { $EndpointUrl }
 
 # "ESET Licence" is '<public ID> | <key>' for EBA/NFR and just the public ID for MSP
 # (same convention Monitor-ESET.ps1 reads).
@@ -307,7 +336,7 @@ $activationNote =
     else                    { "WARNING: $LicType client but field 'ESET Licence' has no valid '<public ID> | <key>' - it will install UNACTIVATED; the monitor will then alert 'not activated'." }
 
 Write-Output "$env:COMPUTERNAME ($($os.Caption)): ESET Management Agent $($agent.DisplayVersion) present, no ESET product. Client licence type $LicType."
-Write-Output "  Would install: $productName from $url"
+Write-Output "  Would install: $productName from $url$(if ($isArm64) { ' (ARM64 build)' })"
 Write-Output "  Activation: $activationNote"
 if ($prev) { Write-Output "  Last recorded backup install: $($prev.state) at $($prev.updatedUtc) - $($prev.message)" }
 

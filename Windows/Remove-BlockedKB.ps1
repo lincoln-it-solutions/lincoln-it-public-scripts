@@ -124,7 +124,20 @@ try {
         Where-Object { $_.PackageState -eq 'Installed' -and $skipTypes -notcontains "$($_.ReleaseType)" } |
         ForEach-Object { Get-WindowsPackage -Online -PackageName $_.PackageName }
 
+    # --- Packages already removed but waiting for a restart (state UninstallPending, from the DISM package-state
+    #     list: Microsoft's DismStateUninstallPending = "An uninstall process for the package is pending"). Windows
+    #     may still list the KB (Get-HotFix) until the restart, but it is no longer in state Installed, so without
+    #     this the next run would report "0 packages matched" as an ERROR even though the removal worked.
+    #     ASSUMPTION, NOT VERIFIED ON WINDOWS: the PowerShell state text is "UninstallPending" (matched loosely).
+    $pendingPackages = @(Get-WindowsPackage -Online |
+        Where-Object { "$($_.PackageState)" -match 'UninstallPending' } |
+        ForEach-Object { Get-WindowsPackage -Online -PackageName $_.PackageName })
+
     foreach ($kb in $installed) {
+        if (@($pendingPackages | Where-Object { "$($_.Description)" -match "\b$kb\b" }).Count -gt 0) {
+            Write-Output "$kb : already removed, waiting for a restart to finish (reboot nag will prompt). Nothing to do."
+            continue
+        }
         $match = @($packages | Where-Object { "$($_.Description)" -match "\b$kb\b" })
         if ($match.Count -ne 1) {
             Write-Output "ERROR: $kb is installed but $($match.Count) package(s) matched it; not guessing. Remove manually (DISM /Online /Get-Packages)."
