@@ -632,8 +632,14 @@ if ($null -eq $prot) {
 #        'will-expire', expiry 2026-11-05)
 # A genuinely expired licence is still caught by the licence check (section 3),
 # and any other status ID still alerts as before.
+# 2026-11-16 (Ethan: "i dont want this warning for a whole 2 weeks ... trials are by design short lived"):
+#   eset_licensing_integration.trial_license.expires_soon
+#     -> "Trial subscription expires", status 1 (seen live on LAPTOP-I3JRTIMR, licence 3BD-C8F-EF4, MSP trial).
+#   Only the pre-warning is ignored. A trial that has actually expired is still reported by the
+#   separate expiry checks.
 $IgnoredStatusIds = @(
-    'eset_licensing_integration.renewable_license.expires_soon'
+    'eset_licensing_integration.renewable_license.expires_soon',
+    'eset_licensing_integration.trial_license.expires_soon'
 )
 
 # Status items we may diagnose or fix later (section 7), remembered by the

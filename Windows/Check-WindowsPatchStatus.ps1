@@ -104,6 +104,14 @@ try {
 
     # Opt-out: "Exclude From Patching" checkbox on Client, Site or Agent (arrives as "$True"/"$False",
     # tacticalrmm utils.py format_shell_bool). Excluded devices pass and are not changed.
+    # Service Tier gate: PAYG and Not Under Support clients are reactive, so no patching work is done.
+    # TRMM passes the client custom field as the SERVICE_TIER env var ({{client.Service Tier}}). A blank
+    # or unresolved value is NOT excluded (fail open - a Support client must never be skipped by mistake).
+    $serviceTier = "$([Environment]::GetEnvironmentVariable('SERVICE_TIER'))".Trim()
+    if ($serviceTier -eq 'PAYG' -or $serviceTier -eq 'Not Under Support') {
+        Write-Output "EXCLUDED: client Service Tier is '$serviceTier' (reactive). Nothing checked or changed."
+        Stop-Check 0
+    }
     foreach ($exclVar in 'WU_EXCLUDE_CLIENT', 'WU_EXCLUDE_SITE', 'WU_EXCLUDE_AGENT') {
         if ("$([Environment]::GetEnvironmentVariable($exclVar))" -match '^\$?true$|^1$') {
             Write-Output "EXCLUDED from patching ($exclVar is ticked). Not checked."
@@ -111,6 +119,14 @@ try {
         }
     }
     $build = [int]$os.BuildNumber
+
+    # Windows 10 is end of life (Ethan 2026-11-16): not patched by this system and not monitored, so pass without
+    # checking. Windows 11 builds start at 22000 (same rule Set-WUfBPolicy.ps1 uses; the Caption is localised so it is
+    # not used). Servers are excluded from this rule: Windows Server builds are also below 22000.
+    if (-not $isServer -and $build -lt 22000) {
+        Write-Output "EXCLUDED: Windows 10 (build $build) is end of life. Not checked."
+        Stop-Check 0
+    }
 
     # --- 1. Windows Update service must not be disabled, or nothing installs.
     $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue

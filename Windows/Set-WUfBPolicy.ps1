@@ -175,6 +175,12 @@ try {
     # 3. Windows 11 vs Windows 10. Windows 11 builds start at 22000; Caption is
     #    not used because it is localised.
     $build = [int]$os.BuildNumber
+    # Windows 10 is end of life (Ethan 2026-11-16): no policy is applied or changed. Values already on a PC from
+    # earlier runs are left as they are. (Servers never get here: they exit above on ProductType.)
+    if ($build -lt 22000) {
+        Write-Output "EXCLUDED: Windows 10 (build $build) is end of life. Nothing checked or changed."
+        Stop-Check 0
+    }
     if ($build -ge 22000) { $product = 'Windows 11'; $target = $TargetFeatureVersion }
     else                  { $product = 'Windows 10'; $target = $Windows10Version }
     Write-Output "Device: $($os.Caption) build $build -> holding on $product $target"

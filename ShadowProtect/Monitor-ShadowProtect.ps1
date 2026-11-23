@@ -31,7 +31,7 @@
       4. No history   - product installed but no backup events at all in LookbackDays
                         (warning: unused install, or the event log has been cleared).
 
-    Where the data comes from (all seen on real Lincoln IT devices on 2026-10-20)
+    Where the data comes from (all seen on real devices on 2026-10-20)
       SPX     Application log, provider "ShadowProtectSPX":
                 Id 3 (Information) "Backup Finished ... Backup "<job>" on <host> successfully finished"
                 Id 5 (Error)       "Backup Failed ... Backup "<job>" on <host> failed backing up ..."

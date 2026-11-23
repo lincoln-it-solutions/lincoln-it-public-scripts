@@ -41,7 +41,7 @@
 
     Where the data comes from
       Arcserve/StorageCraft do not publish an ImageManager event Id list that we could find,
-      so the Ids below are what was actually logged on Lincoln IT devices (TEST-WIN11,
+      so the Ids below are what was actually logged on managed devices (TEST-WIN11,
       LCM-SRV-HPV, D5C8JM54, Belvin SERVER) on 2026-10-20. Provider: "StorageCraft ImageManager".
         1120 Information  first line = image file processed, e.g. "\\nas\backups\X\C_VOL-b002-i8326-cd.spi"
                           ("-cd"/"-cw" = daily/weekly consolidated file) -> success for that folder
